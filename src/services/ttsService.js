@@ -282,7 +282,7 @@ class TTSService {
   // Phuong phap: goi Windows SAPI qua endpoint /offline/synthesize (Node/PowerShell)
   // - Xu ly song song theo so luong CPU de toi da toc do
   // - Tong hop am thanh WAV im lang, khong phat qua loa
-  // - Ket hop tat ca WAV -> MP3 bang lamejs
+  // - Lay MP3 truc tiep tu edge-tts backend (giong Viet Neural chinh xac)
 
   async _downloadOfflineSAPI(chunks, fileName, onProgress) {
     const voiceName = this._getSAPIVoiceName();
@@ -293,14 +293,13 @@ class TTSService {
     const total   = batches.length;
 
     const concurrency = Math.max(1, Math.min(navigator.hardwareConcurrency || 4, 8));
-    console.log(`[SAPI-offline] Tong hop: ${total} batch. Song song: ${concurrency} luong.`);
+    console.log(`[EdgeTTS-offline] Tong hop: ${total} batch. Song song: ${concurrency} luong. Giong: ${voiceName}`);
 
-    let completedWavs = 0;
-    let completedMp3s = 0;
+    let completed = 0;
     const mp3Results = new Array(total).fill(null);
 
-    // Ham goi backend SAPI de lay WAV
-    const synthesizeWav = async (text, idx) => {
+    // Ham goi backend edge-tts de lay MP3 truc tiep
+    const synthesizeMp3 = async (text, idx) => {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const resp = await fetch('/offline/synthesize', {
@@ -308,79 +307,52 @@ class TTSService {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text, voiceName, rate }),
           });
-          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          if (!resp.ok) {
+            const errBody = await resp.json().catch(() => ({}));
+            throw new Error(errBody.error || 'HTTP ' + resp.status);
+          }
           const buf = await resp.arrayBuffer();
-          if (buf.byteLength < 44) throw new Error('WAV qua ngan');
-          return buf;
+          if (buf.byteLength < 100) throw new Error('MP3 qua ngan');
+          return new Uint8Array(buf);
         } catch (err) {
-          if (attempt === 2) console.warn(`[SAPI] Bo qua batch ${idx}`);
-          else await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
+          if (attempt === 2) {
+            console.warn(`[EdgeTTS] Bo qua batch ${idx}: ${err.message}`);
+          } else {
+            await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+          }
         }
       }
       return null;
     };
 
-    // Tao pool Web Workers de encode MP3 song song, tan dung full CPU
-    const workerPool = Array.from({ length: concurrency }).map(() => {
-      const w = new Worker(new URL('./mp3Worker.js', import.meta.url));
-      w.isBusy = false;
-      return w;
-    });
-
-    const encodeMp3Async = (wavBuffer, idx) => {
-      return new Promise((resolve) => {
-        // Tim worker ranh
-        const w = workerPool.find(wk => !wk.isBusy) || workerPool[Math.floor(Math.random() * concurrency)];
-        w.isBusy = true;
-        
-        const onMsg = (e) => {
-          if (e.data.id === idx) {
-            w.removeEventListener('message', onMsg);
-            w.isBusy = false;
-            resolve(e.data.mp3Buffer || null);
-          }
-        };
-        w.addEventListener('message', onMsg);
-        w.postMessage({ id: idx, wavBuffer }, [wavBuffer]); // Transfer buffer cho nhanh
-      });
-    };
-
-    // Chay pipeline: lay WAV xong -> chuyen ngay cho Worker encode thanh MP3
+    // Chay song song nhieu luong
     let queueIdx = 0;
     const workerPipeline = async () => {
       while (queueIdx < total) {
         const i = queueIdx++;
-        
-        // 1. Tong hop am thanh tren Backend (SAPI - PowerShell)
-        const wavBuf = await synthesizeWav(batches[i], i);
-        completedWavs++;
-        
-        if (wavBuf) {
-          // 2. Encode thanh MP3 tren Frontend (Web Worker - Multi-core)
-          const mp3Buf = await encodeMp3Async(wavBuf, i);
-          mp3Results[i] = mp3Buf;
-        }
-        
-        completedMp3s++;
-        // Tinh toan tien trinh: 95% danh cho viec fetch va encode tung batch
-        const pct = Math.round((completedMp3s / total) * 95);
+        const mp3Buf = await synthesizeMp3(batches[i], i);
+        mp3Results[i] = mp3Buf;
+        completed++;
+        const pct = Math.round((completed / total) * 95);
         onProgress && onProgress(pct);
       }
     };
 
     await Promise.all(Array.from({ length: concurrency }, workerPipeline));
 
-    // Don dep worker pool
-    workerPool.forEach(w => w.terminate());
-
     const validMp3s = mp3Results.filter(Boolean);
     if (validMp3s.length === 0) {
-      throw new Error('Khong the tong hop va ma hoa am thanh.');
+      throw new Error(
+        'Khong the tong hop am thanh. Kiem tra:\n' +
+        '- Ket noi internet (edge-tts can internet lan dau)\n' +
+        '- Python va edge-tts da cai dat dung cach\n' +
+        '- Vite dev server dang chay'
+      );
     }
 
     onProgress && onProgress(98);
 
-    // Ghep tat ca MP3 buffer da encode thanh 1 file duy nhat
+    // Ghep tat ca MP3 buffer thanh 1 file duy nhat
     const totalLength = validMp3s.reduce((sum, b) => sum + b.length, 0);
     const merged = new Uint8Array(totalLength);
     let offset = 0;
@@ -393,29 +365,53 @@ class TTSService {
     const outName = fileName.replace(/\.[^.]+$/, '.mp3');
     this._triggerDownload(blob, outName);
     onProgress && onProgress(100);
-    
-    console.log('[SAPI-offline] Hoan thanh 100%! MP3 size:', (blob.size / 1024 / 1024).toFixed(2), 'MB');
+
+    console.log('[EdgeTTS-offline] Hoan thanh 100%! MP3 size:', (blob.size / 1024 / 1024).toFixed(2), 'MB');
   }
+
 
   /**
-   * Lay ten giong SAPI tuong ung voi giong hien tai dang chon.
-   * Web Speech API: "Microsoft Hoai My Online (Natural)"
-   * SAPI name:      "Microsoft Hoai My"
+   * Tra ve edge-tts voice ID chinh xac dua tren giong dang chon.
+   * Tranh hoan toan string-matching o middleware.
    */
   _getSAPIVoiceName() {
+    // Fallback profiles map
     if (!this.voice || this.voice.isFallback) {
-      // Fallback profile: de SAPI tu chon giong Viet
-      return 'Microsoft Hoai My';
+      const uri = this.voice ? this.voice.voiceURI : '';
+      // fallback voices: sv-nu-bac, sv-nu-nam => female, sv-nam-bac, sv-nam-nam => male
+      if (uri.includes('nu')) return 'vi-VN-HoaiMyNeural';
+      if (uri.includes('nam')) return 'vi-VN-NamMinhNeural';
+      return 'vi-VN-HoaiMyNeural'; // default female
     }
-    // Chuan hoa ten: loai bo cac hau to nhu "Online (Natural)", "Desktop"
-    return (this.voice.name || '')
-      .replace(/\s+Online\s*\(Natural\)/gi, '')
-      .replace(/\s+Desktop$/gi, '')
-      .replace(/\s+Mobile$/gi, '')
-      .trim();
+
+    const name = (this.voice.name || '').toLowerCase();
+    
+    // Log de debug
+    console.log('[TTS] _getSAPIVoiceName input:', this.voice.name);
+
+    // Uu tien kiem tra "hoai" truoc (gion nu Hoai My)
+    if (name.includes('hoai')) return 'vi-VN-HoaiMyNeural';
+
+    // Kiem tra "nam minh" chinh xac (gion nam)
+    if (name.includes('nam minh') || name.includes('namminh') || name.includes('minh')) {
+      return 'vi-VN-NamMinhNeural';
+    }
+
+    // Kiem tra theo lang va gender neu co
+    if (this.voice.lang && this.voice.lang.startsWith('vi')) {
+      // Co the dua vao gender neu Web Speech API cung cap
+      const gender = (this.voice.gender || '').toLowerCase();
+      if (gender === 'male') return 'vi-VN-NamMinhNeural';
+      return 'vi-VN-HoaiMyNeural'; // mac dinh la female cho giong Viet
+    }
+
+    // Default
+    return 'vi-VN-HoaiMyNeural';
   }
 
-  // (Removed _encodeWavsToMp3: logic moved to background Web Worker for CPU parallelism)
+
+  // (Removed _encodeWavsToMp3: edge-tts now outputs MP3 directly)
+
 
   // ── ONLINE (Google TTS) ─────────────────────────────────────────────────────
 

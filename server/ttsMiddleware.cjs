@@ -1,16 +1,18 @@
 /**
  * ttsMiddleware.cjs
- * Vite dev-server middleware: silent offline TTS via Windows SAPI (PowerShell)
+ * Vite dev-server middleware: silent offline TTS via Microsoft Edge TTS (edge-tts Python package)
+ * Supports true Vietnamese Neural voices: vi-VN-HoaiMyNeural, vi-VN-NamMinhNeural
+ *
  * Endpoints:
- *   GET  /offline/voices      -> JSON array of installed SAPI voice names
- *   POST /offline/synthesize  -> WAV audio buffer (body: {text, voiceName, rate})
+ *   GET  /offline/voices      -> JSON array of voice objects
+ *   POST /offline/synthesize  -> MP3 audio buffer (body: {text, voiceName, rate, pitch})
  */
 
 'use strict';
-const { execFile } = require('child_process');
-const fs   = require('fs');
-const os   = require('os');
-const path = require('path');
+const { execFile, spawn } = require('child_process');
+const fs     = require('fs');
+const os     = require('os');
+const path   = require('path');
 const crypto = require('crypto');
 
 // ── helpers ────────────────────────────────────────────────────────────────────
@@ -28,118 +30,132 @@ function readBody(req) {
   });
 }
 
-/** Run a PowerShell script file silently, return stdout */
-function runPowerShell(psFile, timeoutMs = 60000) {
-  return new Promise((resolve, reject) => {
-    execFile(
-      'powershell',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', psFile],
-      { timeout: timeoutMs, encoding: 'utf8' },
-      (err, stdout, stderr) => {
-        if (err) reject(new Error(stderr || err.message));
-        else resolve(stdout.trim());
-      }
-    );
-  });
+// Map of friendly display names to edge-tts voice IDs
+const VOICE_MAP = {
+  // Exact names from Web Speech API (Chrome/Edge on Windows)
+  'Microsoft Hoai My Online (Natural) - Vietnamese (Vietnam)':   'vi-VN-HoaiMyNeural',
+  'Microsoft HoaiMy Online (Natural) - Vietnamese (Vietnam)':    'vi-VN-HoaiMyNeural',
+  'Microsoft Hoài My Online (Natural) - Vietnamese (Vietnam)':   'vi-VN-HoaiMyNeural',
+  'Microsoft Hoài My Online (Natural) – Vietnamese (Vietnam)':   'vi-VN-HoaiMyNeural',
+  'Microsoft Nam Minh Online (Natural) - Vietnamese (Vietnam)':  'vi-VN-NamMinhNeural',
+  'Microsoft NamMinh Online (Natural) - Vietnamese (Vietnam)':   'vi-VN-NamMinhNeural',
+  'Microsoft Nam Minh Online (Natural) – Vietnamese (Vietnam)':  'vi-VN-NamMinhNeural',
+  // Edge-tts IDs passed directly
+  'vi-VN-HoaiMyNeural':  'vi-VN-HoaiMyNeural',
+  'vi-VN-NamMinhNeural': 'vi-VN-NamMinhNeural',
+  // Fallback names from ttsService
+  'Microsoft Hoai My Online (Natural) - Vietnamese (Vietnam)':   'vi-VN-HoaiMyNeural',
+};
+
+const VOICE_LIST = [
+  { name: 'Microsoft Hoai My Online (Natural) - Vietnamese (Vietnam)',  edgeId: 'vi-VN-HoaiMyNeural',  gender: 'Female' },
+  { name: 'Microsoft Nam Minh Online (Natural) - Vietnamese (Vietnam)', edgeId: 'vi-VN-NamMinhNeural', gender: 'Male'   },
+];
+
+/** Resolve a voiceName string to an edge-tts voice ID.
+ * Client now sends exact IDs like "vi-VN-HoaiMyNeural" directly.
+ * This function is kept as a safety fallback only.
+ */
+function resolveVoice(voiceName) {
+  if (!voiceName) return 'vi-VN-HoaiMyNeural';
+
+  // If it's already a valid edge-tts voice ID, use it directly
+  const known = ['vi-VN-HoaiMyNeural', 'vi-VN-NamMinhNeural'];
+  if (known.includes(voiceName)) return voiceName;
+
+  // Safety fallback: check for known keywords
+  const lower = voiceName.toLowerCase();
+
+  // Must check 'hoai' first before any 'nam' check
+  if (lower.includes('hoai')) return 'vi-VN-HoaiMyNeural';
+
+  // 'nam minh' or 'namminh' specifically — NOT just 'nam' (which matches "Vietnam")
+  if (lower.includes('namminh') || lower.includes('nam minh') || lower.includes('minh')) {
+    return 'vi-VN-NamMinhNeural';
+  }
+
+  // Default
+  console.warn('[TTS-offline] Unknown voice "' + voiceName + '", defaulting to HoaiMyNeural');
+  return 'vi-VN-HoaiMyNeural';
 }
 
 // ── /offline/voices ────────────────────────────────────────────────────────────
 
-async function getVoices() {
-  const id     = crypto.randomBytes(6).toString('hex');
-  const psFile = path.join(os.tmpdir(), `tts_voices_${id}.ps1`);
-
-  const script = `
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Add-Type -AssemblyName System.Speech
-$synth  = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$names  = $synth.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name }
-$synth.Dispose()
-$names -join "|"
-`.trim();
-
-  fs.writeFileSync(psFile, script, 'utf8');
-  try {
-    const out = await runPowerShell(psFile, 15000);
-    return out ? out.split('|').map(n => n.trim()).filter(Boolean) : [];
-  } finally {
-    try { fs.unlinkSync(psFile); } catch {}
-  }
+function getVoices() {
+  return Promise.resolve(VOICE_LIST.map(v => v.name));
 }
 
 // ── /offline/synthesize ────────────────────────────────────────────────────────
 
 /**
- * Synthesize `text` silently to WAV using Windows SAPI.
- * @param {string} text        - Text to speak
- * @param {string} voiceName   - SAPI voice name (e.g. "Microsoft Hoai My")
- * @param {number} webRate     - Web Speech rate (0.5–2, default 1)
- * @returns {Buffer} WAV audio buffer
+ * Synthesize text to MP3 using edge-tts (Microsoft Edge Neural TTS).
+ * edge-tts supports true Vietnamese Neural voices via the internet-facing Microsoft API.
+ * However it uses the same backend as Edge browser's read-aloud, which is fast.
+ *
+ * @param {string} text       - Text to speak
+ * @param {string} voiceName  - Display name or edge-tts voice ID
+ * @param {number} webRate    - Web Speech rate (0.5–2, default 1)
+ * @returns {Buffer} MP3 audio buffer
  */
-async function synthesizeWav(text, voiceName, webRate = 1) {
-  // Convert Web Speech rate (0.5–2) → SAPI rate (-10…+10)
-  const sapiRate = Math.max(-10, Math.min(10, Math.round((webRate - 1) * 10)));
+async function synthesizeMp3(text, voiceName, webRate = 1) {
+  const edgeVoiceId = resolveVoice(voiceName);
+
+  // Log voice resolution to help debug
+  console.log(`[TTS-offline] Voice: "${voiceName}" -> "${edgeVoiceId}"`);
+
+  // Convert Web Speech rate (0.5–2) -> edge-tts rate string (+XX% or -XX%)
+  const ratePct = Math.round((webRate - 1) * 100);
+  const rateStr = (ratePct >= 0 ? '+' : '') + ratePct + '%';
+
+  // Sanitize text: remove control chars, trim
+  const cleanText = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ').trim();
+  if (!cleanText) throw new Error('Text rong sau khi xu ly');
 
   const id      = crypto.randomBytes(8).toString('hex');
   const tmpDir  = os.tmpdir();
   const txtFile = path.join(tmpDir, `tts_in_${id}.txt`);
-  const wavFile = path.join(tmpDir, `tts_out_${id}.wav`);
-  const psFile  = path.join(tmpDir, `tts_ps_${id}.ps1`);
+  const mp3File = path.join(tmpDir, `tts_out_${id}.mp3`);
 
-  // Write text as UTF-8 to a temp file (avoids PowerShell escaping issues)
-  fs.writeFileSync(txtFile, text, 'utf8');
+  fs.writeFileSync(txtFile, cleanText, 'utf8');
 
-  // Build PowerShell script
-  const escapedWav = wavFile.replace(/\\/g, '\\\\');
+  // Build Python script for edge-tts
   const escapedTxt = txtFile.replace(/\\/g, '\\\\');
+  const escapedMp3 = mp3File.replace(/\\/g, '\\\\');
 
-  const script = `
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Add-Type -AssemblyName System.Speech
+  const pyScript = `
+import asyncio, edge_tts, sys
 
-$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+async def main():
+    with open(r'${escapedTxt}', 'r', encoding='utf-8') as f:
+        text = f.read().strip()
+    if not text:
+        print('SKIP_EMPTY')
+        return
+    communicate = edge_tts.Communicate(text, '${edgeVoiceId}', rate='${rateStr}')
+    await communicate.save(r'${escapedMp3}')
+    print('OK')
 
-# Set output format: 22050 Hz, 16-bit, mono for best lamejs compatibility
-$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(
-    22050,
-    [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen,
-    [System.Speech.AudioFormat.AudioChannel]::Mono
-)
-$synth.SetOutputToWaveFile('${escapedWav}', $fmt)
-
-# Set rate
-$synth.Rate = ${sapiRate}
-
-# Select voice (try exact match first, then partial)
-$installed = $synth.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name }
-$target = '${voiceName.replace(/'/g, "''")}'
-$matched = $installed | Where-Object { $_ -like "*$target*" } | Select-Object -First 1
-if (-not $matched) {
-    # Fallback: pick first Vietnamese voice
-    $matched = $installed | Where-Object { $_ -like "*Hoai*" -or $_ -like "*An*" -or $_ -like "*Vietnamese*" -or $_ -like "*Viet*" } | Select-Object -First 1
-}
-if ($matched) { $synth.SelectVoice($matched) }
-
-# Read text from file and speak
-$text = [System.IO.File]::ReadAllText('${escapedTxt}', [System.Text.Encoding]::UTF8)
-$synth.Speak($text)
-$synth.Dispose()
-Write-Output "OK"
+asyncio.run(main())
 `.trim();
 
-  fs.writeFileSync(psFile, script, 'utf8');
+  const pyFile = path.join(tmpDir, `tts_py_${id}.py`);
+  fs.writeFileSync(pyFile, pyScript, 'utf8');
 
   try {
-    await runPowerShell(psFile, 60000);
+    await new Promise((resolve, reject) => {
+      execFile('python', [pyFile], { timeout: 90000, encoding: 'utf8' }, (err, stdout, stderr) => {
+        if (err) reject(new Error(stderr || err.message));
+        else resolve(stdout.trim());
+      });
+    });
 
-    if (!fs.existsSync(wavFile)) {
-      throw new Error('WAV file was not created by SAPI.');
+    if (!fs.existsSync(mp3File)) {
+      throw new Error('MP3 file was not created by edge-tts.');
     }
-    const wav = fs.readFileSync(wavFile);
-    return wav;
+    const mp3 = fs.readFileSync(mp3File);
+    return mp3;
   } finally {
-    // Always clean up temp files
-    for (const f of [txtFile, psFile, wavFile]) {
+    for (const f of [txtFile, pyFile, mp3File]) {
       try { fs.unlinkSync(f); } catch {}
     }
   }
@@ -172,15 +188,15 @@ module.exports = function ttsMiddleware(req, res, next) {
         if (!text || text.trim().length === 0) {
           res.statusCode = 400;
           res.end(JSON.stringify({ error: 'Empty text' }));
-          return;
+          return Promise.resolve(null);
         }
-        return synthesizeWav(text, voiceName || '', rate || 1);
+        return synthesizeMp3(text, voiceName || '', rate || 1);
       })
-      .then(wavBuf => {
-        if (!wavBuf) return; // already responded with error
-        res.setHeader('Content-Type', 'audio/wav');
-        res.setHeader('Content-Length', wavBuf.length);
-        res.end(wavBuf);
+      .then(mp3Buf => {
+        if (!mp3Buf) return;
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Content-Length', mp3Buf.length);
+        res.end(mp3Buf);
       })
       .catch(err => {
         console.error('[TTS-offline] synthesize error:', err.message);
