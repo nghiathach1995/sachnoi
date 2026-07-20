@@ -32,6 +32,7 @@ export const parsePdf = async (file) => {
       let lastY = null;
       let lastWidth = 0;
       let lastFontSize = 12;
+      let lastFontSizeCharCount = 0;
 
       for (let j = 0; j < items.length; j++) {
         const item = items[j];
@@ -42,7 +43,24 @@ export const parsePdf = async (file) => {
         const [, , , , x, y] = item.transform; // [scaleX, skewX, skewY, scaleY, translateX, translateY]
         const fontSize = Math.abs(item.transform[3]) || lastFontSize;
 
-        if (lastY === null) {
+        let isDropCap = false;
+        if (Math.abs(fontSize - lastFontSize) > 0.5) {
+          // Nếu font size giảm mạnh (chữ trước to hơn chữ này > 1.4 lần)
+          // VÀ chữ trước rất ngắn (<= 4 ký tự) -> Đây là Drop Cap (chữ to đầu đoạn)
+          if (lastFontSize > fontSize * 1.4 && lastFontSizeCharCount > 0 && lastFontSizeCharCount <= 4) {
+            isDropCap = true;
+          }
+          lastFontSizeCharCount = item.str.trim().length;
+        } else {
+          lastFontSizeCharCount += item.str.trim().length;
+        }
+
+        if (isDropCap) {
+          // Xóa các khoảng trắng/xuống dòng thừa do Drop Cap tạo ra
+          pageText = pageText.replace(/\s+$/, '');
+          // Nối trực tiếp vào phần còn lại của chữ (VD: "M" + "ỗi" -> "Mỗi")
+          pageText += item.str;
+        } else if (lastY === null) {
           // First item on the page
           pageText += item.str;
         } else {
@@ -74,7 +92,29 @@ export const parsePdf = async (file) => {
         }
       }
 
-      fullText += pageText.trim() + '\n\n';
+      let trimmedPageText = pageText.trim();
+      
+      // Bỏ qua số trang ở đầu và cuối trang (VD: "1", "- 2 -", "Trang 3")
+      if (trimmedPageText.length > 0) {
+        const pageNumRegex = /^(?:trang|page)?\s*-?\s*\d+\s*-?\s*$/i;
+        let lines = trimmedPageText.split('\n');
+        
+        // Xóa dòng số trang ở đầu
+        while (lines.length > 0 && (lines[0].trim() === '' || pageNumRegex.test(lines[0].trim()))) {
+          lines.shift();
+        }
+        
+        // Xóa dòng số trang ở cuối
+        while (lines.length > 0 && (lines[lines.length - 1].trim() === '' || pageNumRegex.test(lines[lines.length - 1].trim()))) {
+          lines.pop();
+        }
+        
+        trimmedPageText = lines.join('\n').trim();
+      }
+
+      if (trimmedPageText.length > 0) {
+        fullText += trimmedPageText + '\n\n';
+      }
     }
 
     return fullText;

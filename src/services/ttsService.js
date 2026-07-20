@@ -292,7 +292,8 @@ class TTSService {
     const batches = this.splitParagraphForFallback(allText, 175);
     const total   = batches.length;
 
-    const concurrency = Math.max(1, Math.min(navigator.hardwareConcurrency || 4, 8));
+    // Gioi han concurrency o 3 de tranh bi Microsoft rate-limit (NoAudioReceived)
+    const concurrency = Math.max(1, Math.min(navigator.hardwareConcurrency || 2, 3));
     console.log(`[EdgeTTS-offline] Tong hop: ${total} batch. Song song: ${concurrency} luong. Giong: ${voiceName}`);
 
     let completed = 0;
@@ -327,7 +328,9 @@ class TTSService {
 
     // Chay song song nhieu luong
     let queueIdx = 0;
-    const workerPipeline = async () => {
+    const workerPipeline = async (workerIdx) => {
+      // Stagger worker starts de tranh burst request cung luc
+      await new Promise(r => setTimeout(r, workerIdx * 200));
       while (queueIdx < total) {
         const i = queueIdx++;
         const mp3Buf = await synthesizeMp3(batches[i], i);
@@ -335,10 +338,12 @@ class TTSService {
         completed++;
         const pct = Math.round((completed / total) * 95);
         onProgress && onProgress(pct);
+        // Delay nho giua cac request de tranh rate-limit
+        if (queueIdx < total) await new Promise(r => setTimeout(r, 150));
       }
     };
 
-    await Promise.all(Array.from({ length: concurrency }, workerPipeline));
+    await Promise.all(Array.from({ length: concurrency }, (_, idx) => workerPipeline(idx)));
 
     const validMp3s = mp3Results.filter(Boolean);
     if (validMp3s.length === 0) {
