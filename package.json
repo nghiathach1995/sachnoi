@@ -11,8 +11,10 @@
   },
   "dependencies": {
     "epubjs": "^0.3.93",
+    "idb-keyval": "^6.3.0",
     "lamejs": "^1.2.1",
     "lucide-react": "^1.25.0",
+    "mammoth": "^1.12.0",
     "pdfjs-dist": "^6.1.200",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"

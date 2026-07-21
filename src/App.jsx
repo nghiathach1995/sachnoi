@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Upload, Play, Pause, SkipBack, SkipForward, FileText, Headphones, FileDown, Download, Wifi, WifiOff, Folder, File, StopCircle, CheckCircle, XCircle, Clock, Loader } from 'lucide-react';
+import { Settings, Play, Pause, SkipBack, SkipForward, File, Upload, CheckCircle, XCircle, Clock, Loader, Folder, Volume2, Music, FileText, Headphones, FileDown, Download, Wifi, WifiOff } from 'lucide-react';
+import { get, set } from 'idb-keyval';
 import { parseFile } from './services/fileParser';
 import ttsService from './services/ttsService';
 
@@ -31,8 +32,18 @@ function App() {
   const [downloadMode, setDownloadMode] = useState('offline');
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
-  const [downloadError, setDownloadError] = useState(null);
   const [downloadDone, setDownloadDone] = useState(false);
+  const [downloadError, setDownloadError] = useState(null);
+  
+  const [silenceDuration, setSilenceDuration] = useState(0);
+  const [exportSrt, setExportSrt] = useState(false);
+  const [mergeBatch, setMergeBatch] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(true);
+
+  useEffect(() => {
+    if (isDarkMode) document.body.classList.remove('light-mode');
+    else document.body.classList.add('light-mode');
+  }, [isDarkMode]);
 
   // ─── Batch (folder) state ──────────────────────────────────────────────────
   const [folderMode, setFolderMode] = useState(false);
@@ -43,9 +54,15 @@ function App() {
   const [isBatchRunning, setIsBatchRunning] = useState(false);
   const batchCancelledRef = useRef(false);
 
+  // New features state
+  const [karaokeWord, setKaraokeWord] = useState('');
+  const [bgmEnabled, setBgmEnabled] = useState(false);
+  const bgmRef = useRef(null);
+
   useEffect(() => {
     ttsService.getVoices().then(availableVoices => {
-      const sortedVoices = [...availableVoices].sort((a, b) => {
+      const validVoices = availableVoices.filter(v => !(v.name || '').toLowerCase().includes('undefined'));
+      const sortedVoices = [...validVoices].sort((a, b) => {
         const aLang = a.lang || '';
         const bLang = b.lang || '';
         if (aLang.startsWith('vi') && !bLang.startsWith('vi')) return -1;
@@ -57,14 +74,28 @@ function App() {
       if (defaultVoice) setSelectedVoice(defaultVoice.voiceURI);
     }).catch(err => console.error('Error loading voices:', err));
 
-    ttsService.onStateChange = (playing) => setIsPlaying(playing);
+    ttsService.onStateChange = (playing) => {
+      setIsPlaying(playing);
+      // Audio ducking for BGM
+      if (bgmRef.current) {
+        bgmRef.current.volume = playing ? 0.1 : 0.4;
+      }
+    };
     ttsService.onProgress = (current, total) => {
       setProgress({ current, total });
-      if (total > 0 && current < total) setCurrentText(ttsService.chunks[current]);
+      if (total > 0 && current < total) {
+        setCurrentText(ttsService.chunks[current]);
+        // Save bookmark automatically
+        if (uploadedFileName) {
+          set(`bookmark-${uploadedFileName}`, current).catch(console.error);
+        }
+      }
       else setCurrentText('');
     };
+    ttsService.onKaraokeCue = (word) => setKaraokeWord(word);
+    
     return () => ttsService.stop();
-  }, []);
+  }, [uploadedFileName]);
 
   useEffect(() => {
     ttsService.setSettings(selectedVoice, rate, pitch);
@@ -80,9 +111,22 @@ function App() {
     setDownloadProgress(0);
     ttsService.stop();
     setUploadedFileName(file.name || 'audio');
+    
     try {
-      const text = await parseFile(file);
+      const fileKey = `${file.name}-${file.size}`;
+      let text = await get(fileKey);
+      
+      if (!text) {
+        text = await parseFile(file);
+        await set(fileKey, text).catch(console.error);
+      }
+      
+      // Restore bookmark if available
+      const savedIndex = await get(`bookmark-${file.name || 'audio'}`);
       ttsService.loadText(text);
+      if (savedIndex && savedIndex > 0) {
+        ttsService.seek(savedIndex);
+      }
     } catch (err) {
       setError('Không thể đọc file: ' + err.message);
     } finally {
@@ -168,7 +212,12 @@ function App() {
   // ─── Playback ──────────────────────────────────────────────────────────────
   const togglePlay = () => {
     if (isPlaying) ttsService.pause();
-    else ttsService.resume();
+    else {
+      ttsService.resume();
+      if (bgmEnabled && bgmRef.current && bgmRef.current.paused) {
+        bgmRef.current.play().catch(e => console.log('BGM Autoplay blocked', e));
+      }
+    }
   };
 
   const handleProgressClick = (e) => {
@@ -197,7 +246,9 @@ function App() {
         ttsService.chunks.join('\n\n'),
         downloadMode,
         outFileName,
-        (pct) => setDownloadProgress(Math.round(pct))
+        (pct) => setDownloadProgress(Math.round(pct)),
+        silenceDuration,
+        exportSrt
       );
       setDownloadDone(true);
     } catch (err) {
@@ -218,51 +269,80 @@ function App() {
     // Reset status
     setBatchStatus(batchFiles.map(f => ({ name: f.name, status: 'pending', progress: 0, error: null })));
 
-    for (let i = 0; i < batchFiles.length; i++) {
-      if (batchCancelledRef.current) break;
-
-      const file = batchFiles[i];
-      setBatchIndex(i);
-
-      // Mark as processing
-      setBatchStatus(prev => {
-        const next = [...prev];
-        next[i] = { ...next[i], status: 'processing', progress: 0 };
-        return next;
-      });
-
+    if (mergeBatch) {
+      setBatchIndex(0);
+      setBatchStatus(prev => prev.map(item => ({ ...item, status: 'processing', progress: 50 })));
       try {
-        // Parse file
-        const text = await parseFile(file);
-        ttsService.loadText(text);
-
+        let allText = '';
+        for (let i = 0; i < batchFiles.length; i++) {
+          if (batchCancelledRef.current) break;
+          const text = await parseFile(batchFiles[i]);
+          allText += text + '\n\n';
+        }
+        if (!batchCancelledRef.current) {
+          const outName = `${folderName}_Merged.mp3`;
+          await ttsService.downloadAudio(
+            allText,
+            downloadMode,
+            outName,
+            (pct) => {
+               setBatchStatus(prev => prev.map(item => ({ ...item, progress: Math.round(pct) })));
+            },
+            silenceDuration,
+            exportSrt
+          );
+          setBatchStatus(prev => prev.map(item => ({ ...item, status: 'done', progress: 100 })));
+        }
+      } catch (err) {
+        setBatchStatus(prev => prev.map(item => ({ ...item, status: 'error', error: err.message })));
+      }
+    } else {
+      for (let i = 0; i < batchFiles.length; i++) {
         if (batchCancelledRef.current) break;
 
-        const baseName = file.name.replace(/\.[^.]+$/, '');
-        await ttsService.downloadAudio(
-          ttsService.chunks.join('\n\n'),
-          downloadMode,
-          baseName + '.mp3',
-          (pct) => {
-            setBatchStatus(prev => {
-              const next = [...prev];
-              next[i] = { ...next[i], progress: Math.round(pct) };
-              return next;
-            });
-          }
-        );
+        const file = batchFiles[i];
+        setBatchIndex(i);
 
         setBatchStatus(prev => {
           const next = [...prev];
-          next[i] = { ...next[i], status: 'done', progress: 100 };
+          next[i] = { ...next[i], status: 'processing', progress: 0 };
           return next;
         });
-      } catch (err) {
-        setBatchStatus(prev => {
-          const next = [...prev];
-          next[i] = { ...next[i], status: 'error', error: err.message };
-          return next;
-        });
+
+        try {
+          const text = await parseFile(file);
+          ttsService.loadText(text);
+
+          if (batchCancelledRef.current) break;
+
+          const baseName = file.name.replace(/\.[^.]+$/, '');
+          await ttsService.downloadAudio(
+            ttsService.chunks.join('\n\n'),
+            downloadMode,
+            baseName + '.mp3',
+            (pct) => {
+              setBatchStatus(prev => {
+                const next = [...prev];
+                next[i] = { ...next[i], progress: Math.round(pct) };
+                return next;
+              });
+            },
+            silenceDuration,
+            exportSrt
+          );
+
+          setBatchStatus(prev => {
+            const next = [...prev];
+            next[i] = { ...next[i], status: 'done', progress: 100 };
+            return next;
+          });
+        } catch (err) {
+          setBatchStatus(prev => {
+            const next = [...prev];
+            next[i] = { ...next[i], status: 'error', error: err.message };
+            return next;
+          });
+        }
       }
     }
 
@@ -285,7 +365,6 @@ function App() {
 
   const outputFormat = 'MP3';
 
-  // ─── Status icon component ─────────────────────────────────────────────────
   const StatusIcon = ({ status }) => {
     if (status === 'done')       return <CheckCircle size={16} color="#4ade80" />;
     if (status === 'error')      return <XCircle size={16} color="#f87171" />;
@@ -293,11 +372,36 @@ function App() {
     return <Clock size={16} color="#9ca3af" />;
   };
 
+  const renderKaraokeText = (text, targetWord) => {
+    if (!targetWord) return text;
+    const idx = text.toLowerCase().indexOf(targetWord.toLowerCase());
+    if (idx === -1) return text;
+    
+    const before = text.slice(0, idx);
+    const match = text.slice(idx, idx + targetWord.length);
+    const after = text.slice(idx + targetWord.length);
+    
+    return (
+      <>
+        {before}
+        <mark className="karaoke-highlight">{match}</mark>
+        {after}
+      </>
+    );
+  };
+
   return (
     <div className="app-container">
-      <header className="header">
+      <header className="header" style={{ position: 'relative' }}>
+        <button 
+          onClick={() => setIsDarkMode(!isDarkMode)} 
+          style={{ position: 'absolute', right: 0, top: 0, padding: '0.6rem', borderRadius: '50%', background: 'var(--glass-bg)', color: 'var(--text-main)', border: '1px solid var(--glass-border)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          title={isDarkMode ? 'Bật giao diện sáng' : 'Bật giao diện tối'}
+        >
+          {isDarkMode ? '🌞' : '🌙'}
+        </button>
         <h1>AI Audiobook</h1>
-        <p>Đọc sách định dạng TXT, PDF, EPUB với giọng nói tự nhiên hoàn toàn miễn phí</p>
+        <p>Đọc sách định dạng TXT, DOCX, PDF, EPUB với giọng nói tự nhiên hoàn toàn miễn phí</p>
       </header>
 
       <main>
@@ -428,48 +532,76 @@ function App() {
             </div>
 
             <div className="settings-group">
+              <label>Thời gian nghỉ (Padding): {silenceDuration}s</label>
+              <input type="range" min="0" max="3" step="1" value={silenceDuration} onChange={(e) => setSilenceDuration(parseInt(e.target.value))} />
+            </div>
+
+            <div className="settings-group">
               <label>Cao độ: {pitch.toFixed(1)}</label>
               <input type="range" min="0" max="2" step="0.1" value={pitch} onChange={(e) => setPitch(parseFloat(e.target.value))} />
             </div>
-          </div>
+              <div className="settings-group">
+                <label>Nhạc nền (Lofi)</label>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <input 
+                    type="checkbox" 
+                    id="bgmToggle"
+                    checked={bgmEnabled}
+                    onChange={(e) => {
+                      setBgmEnabled(e.target.checked);
+                      if (e.target.checked && bgmRef.current && isPlaying) bgmRef.current.play().catch(() => {});
+                      else if (!e.target.checked && bgmRef.current) bgmRef.current.pause();
+                    }}
+                    style={{ width: '18px', height: '18px', accentColor: 'var(--accent-primary)' }}
+                  />
+                  <label htmlFor="bgmToggle" style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer', margin: 0, fontSize: '0.9rem' }}>
+                    <Music size={16} color="var(--accent-primary)" /> Bật nhạc nền thư giãn
+                  </label>
+                </div>
+              </div>
+            </div>
+            {/* Hidden BGM Audio Tag */}
+            <audio ref={bgmRef} loop src="https://cdn.pixabay.com/download/audio/2022/05/27/audio_1808fbf07a.mp3?filename=lofi-study-112191.mp3" />
 
-          <div className="glass-panel" style={{ flex: 2, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-            <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1.5rem', justifyContent: 'center' }}>
-              Trình phát <FileText size={20} />
+          {/* ─── Floating Player & Reading Panel ───────────────────────────── */}
+          <div className="glass-panel floating-player-container" style={{ flex: 2, display: 'flex', flexDirection: 'column', paddingBottom: '80px', position: 'relative' }}>
+            <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1rem' }}>
+              <File size={24} /> Đang đọc (Karaoke Mode)
             </h3>
-
-            <div className="playback-controls">
-              <button className="btn-icon" onClick={() => ttsService.prev()} disabled={progress.total === 0}>
-                <SkipBack size={24} />
-              </button>
-              <button className="btn" onClick={togglePlay} disabled={progress.total === 0} style={{ padding: '1rem', borderRadius: '50%' }}>
-                {isPlaying ? <Pause size={32} /> : <Play size={32} style={{ marginLeft: '4px' }} />}
-              </button>
-              <button className="btn-icon" onClick={() => ttsService.next()} disabled={progress.total === 0}>
-                <SkipForward size={24} />
-              </button>
+            <div className="reading-box" style={{ flex: 1, minHeight: '300px', fontSize: '1.2rem', lineHeight: '1.8' }}>
+              {currentText ? renderKaraokeText(currentText, karaokeWord) : <span style={{ color: 'var(--text-muted)' }}>Chưa có nội dung nào được phát.</span>}
             </div>
+            
+            {/* Floating Player Controls */}
+            <div className="floating-player">
+              <div style={{ display: 'flex', justifyContent: 'center', gap: '1.5rem', marginBottom: '0.7rem' }}>
+                <button className="icon-btn" onClick={() => ttsService.prev()} disabled={progress.total === 0}>
+                  <SkipBack size={24} />
+                </button>
+                <button className="play-btn" onClick={togglePlay} disabled={progress.total === 0} style={{ padding: '0.8rem', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  {isPlaying ? <Pause size={30} /> : <Play size={30} style={{ marginLeft: '4px' }} />}
+                </button>
+                <button className="icon-btn" onClick={() => ttsService.next()} disabled={progress.total === 0}>
+                  <SkipForward size={24} />
+                </button>
+              </div>
 
-            <div className="progress-container" onClick={handleProgressClick}>
-              <div
-                className="progress-bar"
-                style={{ width: `${progress.total > 0 ? (progress.current / progress.total) * 100 : 0}%` }}
-              />
-            </div>
-            <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-              {progress.total > 0 ? `${progress.current + 1} / ${progress.total}` : 'Chưa có file nào'}
+              <div 
+                className="progress-bar" 
+                onClick={handleProgressClick}
+                style={{ cursor: progress.total > 0 ? 'pointer' : 'default', height: '8px', borderRadius: '4px', background: 'var(--glass-border)' }}
+              >
+                <div 
+                  className="progress-fill" 
+                  style={{ width: progress.total > 0 ? `${(progress.current / progress.total) * 100}%` : '0%', height: '100%', background: 'var(--accent-primary)', borderRadius: '4px', transition: 'width 0.3s ease' }}
+                />
+              </div>
+              <div style={{ textAlign: 'center', fontSize: '0.85rem', color: 'var(--text-muted)', marginTop: '0.5rem' }}>
+                {progress.total > 0 ? `${progress.current + 1} / ${progress.total}` : '0 / 0'}
+              </div>
             </div>
           </div>
         </div>
-
-        {currentText && (
-          <div className="glass-panel text-display">
-            <h4 style={{ color: 'var(--accent-hover)', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <FileDown size={20} /> Đang đọc
-            </h4>
-            <p className="highlight">{currentText}</p>
-          </div>
-        )}
 
         {/* ─── Download Section ──────────────────────────────────────────────── */}
         <div className="glass-panel" style={{ marginTop: '2rem' }}>
@@ -508,6 +640,20 @@ function App() {
                 <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>Tải từ Google – xuất MP3, cần internet</div>
               </div>
             </label>
+          </div>
+          
+          <div style={{ display: 'flex', gap: '2rem', marginBottom: '1.5rem', flexWrap: 'wrap', padding: '1rem', background: 'var(--glass-bg)', borderRadius: '0.75rem', border: '1px solid var(--glass-border)' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+              <input type="checkbox" checked={exportSrt} onChange={(e) => setExportSrt(e.target.checked)} style={{ width: '18px', height: '18px', accentColor: 'var(--accent-primary)' }} />
+              <span style={{ fontSize: '0.95rem' }}>Xuất kèm file Phụ đề (.srt)</span>
+            </label>
+
+            {folderMode && (
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input type="checkbox" checked={mergeBatch} onChange={(e) => setMergeBatch(e.target.checked)} style={{ width: '18px', height: '18px', accentColor: 'var(--accent-primary)' }} />
+                <span style={{ fontSize: '0.95rem' }}>Gộp thành 1 file MP3 duy nhất</span>
+              </label>
+            )}
           </div>
 
           {/* ── SINGLE FILE mode UI ── */}

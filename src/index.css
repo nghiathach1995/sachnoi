@@ -1,6 +1,7 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
 :root {
+  /* Dark Mode (Default) */
   --bg-dark: #0f172a;
   --bg-darker: #020617;
   --text-main: #f8fafc;
@@ -11,6 +12,19 @@
   --glass-bg: rgba(30, 41, 59, 0.7);
   --glass-border: rgba(255, 255, 255, 0.1);
   --glass-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+}
+
+body.light-mode {
+  --bg-dark: #f8fafc;
+  --bg-darker: #f1f5f9;
+  --text-main: #0f172a;
+  --text-muted: #475569;
+  --accent-primary: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-glow: rgba(37, 99, 235, 0.3);
+  --glass-bg: rgba(255, 255, 255, 0.8);
+  --glass-border: rgba(0, 0, 0, 0.1);
+  --glass-shadow: 0 4px 30px rgba(0, 0, 0, 0.05);
 }
 
 * {
@@ -240,4 +254,62 @@ body {
 @keyframes spin {
   from { transform: rotate(0deg); }
   to   { transform: rotate(360deg); }
+}
+
+/* ─── Karaoke Mode ──────────────────────────────────────────────────────── */
+.karaoke-highlight {
+  background-color: transparent;
+  color: var(--accent-primary);
+  font-weight: 700;
+  text-shadow: 0 0 8px var(--accent-glow);
+  transition: all 0.1s ease-in-out;
+}
+
+/* ─── Floating Player ────────────────────────────────────────────────────── */
+.floating-player {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: var(--glass-bg);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border-top: 1px solid var(--glass-border);
+  padding: 1rem 2rem;
+  border-bottom-left-radius: 1rem;
+  border-bottom-right-radius: 1rem;
+  z-index: 10;
+}
+
+/* ─── Mobile First & Responsive ──────────────────────────────────────────── */
+@media (max-width: 768px) {
+  .app-container {
+    padding: 1rem;
+  }
+  .controls-row {
+    flex-direction: column;
+  }
+  .header h1 {
+    font-size: 2rem;
+  }
+  
+  /* Mobile Bottom Sheet for settings */
+  .controls-row > .glass-panel:first-child {
+    order: 2; /* Move settings below player on mobile */
+  }
+  
+  .floating-player-container {
+    order: 1; /* Player on top */
+    min-height: 50vh;
+  }
+
+  .floating-player {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    border-radius: 0;
+    padding: 1rem;
+    box-shadow: 0 -4px 20px rgba(0,0,0,0.2);
+  }
 }

@@ -1,5 +1,6 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import ePub from 'epubjs';
+import mammoth from 'mammoth';
 
 // Setup pdf.js worker using Vite's URL import
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
@@ -23,6 +24,9 @@ export const parsePdf = async (file) => {
     let fullText = '';
 
     for (let i = 1; i <= pdf.numPages; i++) {
+      // Yield to main thread every 5 pages to prevent UI freezing
+      if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+      
       const page = await pdf.getPage(i);
       const textContent = await page.getTextContent();
       const items = textContent.items;
@@ -139,6 +143,8 @@ export const parseEpub = (file) => {
         // This is a simplified extraction, for large EPUBs it might be better to extract on demand,
         // but for now we extract all text.
         for (let i = 0; i < spine.length; i++) {
+          if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+          
           const item = spine.get(i);
           const doc = await item.load(book.load.bind(book));
           if (doc) {
@@ -158,17 +164,69 @@ export const parseEpub = (file) => {
   });
 };
 
+export const parseDocx = async (file) => {
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    const result = await mammoth.extractRawText({ arrayBuffer });
+    return result.value;
+  } catch (error) {
+    console.error('Error parsing DOCX:', error);
+    throw error;
+  }
+};
+
+export const filterBookContent = (text) => {
+  // 1. Remove Table of Contents (lines with many dots)
+  let lines = text.split('\n');
+  lines = lines.filter(line => !line.match(/\.{5,}/));
+  text = lines.join('\n');
+  
+  // 2. Normalize punctuation spacing
+  // Remove space before punctuation: "anh ,em" -> "anh, em"
+  text = text.replace(/\s+([,.:;!?])/g, '$1');
+  // Ensure space after punctuation (except if it's followed by digit/quote)
+  text = text.replace(/([,.:;!?])([^\s\d"'\)\]}])/g, '$1 $2');
+  
+  // 3. Fix multiple spaces
+  text = text.replace(/ {2,}/g, ' ');
+  
+  // 4. Vietnamese Abbreviations
+  const abbrevMap = {
+    'UBND': 'Ủy ban nhân dân',
+    'HĐND': 'Hội đồng nhân dân',
+    'TP': 'Thành phố',
+    'HCM': 'Hồ Chí Minh',
+    'HN': 'Hà Nội',
+    'TW': 'Trung ương',
+    'BĐS': 'Bất động sản',
+    'TTg': 'Thủ tướng',
+    'NĐ-CP': 'Nghị định Chính phủ'
+  };
+  
+  for (const [key, value] of Object.entries(abbrevMap)) {
+    const regex = new RegExp(`\\b${key}\\b`, 'g');
+    text = text.replace(regex, value);
+  }
+  
+  return text.trim();
+};
+
 export const parseFile = async (file) => {
   const fileType = file.name.split('.').pop().toLowerCase();
   
+  let rawText = '';
   switch (fileType) {
     case 'txt':
-      return await parseTxt(file);
+      rawText = await parseTxt(file); break;
     case 'pdf':
-      return await parsePdf(file);
+      rawText = await parsePdf(file); break;
     case 'epub':
-      return await parseEpub(file);
+      rawText = await parseEpub(file); break;
+    case 'docx':
+      rawText = await parseDocx(file); break;
     default:
       throw new Error(`Unsupported file type: ${fileType}`);
   }
+  
+  return filterBookContent(rawText);
 };

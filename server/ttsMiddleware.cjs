@@ -123,7 +123,8 @@ async function synthesizeMp3(text, voiceName, webRate = 1) {
   const escapedMp3 = mp3File.replace(/\\/g, '\\\\');
 
   const pyScript = `
-import asyncio, edge_tts, sys
+import asyncio, edge_tts, sys, base64, json
+from edge_tts.submaker import SubMaker
 
 async def main():
     with open(r'${escapedTxt}', 'r', encoding='utf-8') as f:
@@ -131,9 +132,27 @@ async def main():
     if not text:
         print('SKIP_EMPTY')
         return
+        
     communicate = edge_tts.Communicate(text, '${edgeVoiceId}', rate='${rateStr}')
-    await communicate.save(r'${escapedMp3}')
-    print('OK')
+    submaker = SubMaker()
+    
+    with open(r'${escapedMp3}', "wb") as f:
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                f.write(chunk["data"])
+            elif chunk["type"] == "WordBoundary":
+                submaker.feed(chunk)
+                
+    with open(r'${escapedMp3}', "rb") as f:
+        audio_b64 = base64.b64encode(f.read()).decode('utf-8')
+        
+    vtt_text = submaker.get_srt()
+    
+    out_dict = {
+        "audioBase64": audio_b64,
+        "vtt": vtt_text
+    }
+    print(json.dumps(out_dict))
 
 asyncio.run(main())
 `.trim();
@@ -142,18 +161,22 @@ asyncio.run(main())
   fs.writeFileSync(pyFile, pyScript, 'utf8');
 
   try {
-    await new Promise((resolve, reject) => {
-      execFile('python', [pyFile], { timeout: 90000, encoding: 'utf8' }, (err, stdout, stderr) => {
+    const result = await new Promise((resolve, reject) => {
+      execFile('python', [pyFile], { timeout: 90000, encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
         if (err) reject(new Error(stderr || err.message));
         else resolve(stdout.trim());
       });
     });
 
-    if (!fs.existsSync(mp3File)) {
-      throw new Error('MP3 file was not created by edge-tts.');
+    if (result === 'SKIP_EMPTY') {
+      return { audioBase64: '', vtt: '' };
     }
-    const mp3 = fs.readFileSync(mp3File);
-    return mp3;
+    
+    try {
+      return JSON.parse(result);
+    } catch (e) {
+      throw new Error("Invalid output from python: " + result.substring(0, 200));
+    }
   } finally {
     for (const f of [txtFile, pyFile, mp3File]) {
       try { fs.unlinkSync(f); } catch {}
@@ -192,11 +215,10 @@ module.exports = function ttsMiddleware(req, res, next) {
         }
         return synthesizeMp3(text, voiceName || '', rate || 1);
       })
-      .then(mp3Buf => {
-        if (!mp3Buf) return;
-        res.setHeader('Content-Type', 'audio/mpeg');
-        res.setHeader('Content-Length', mp3Buf.length);
-        res.end(mp3Buf);
+      .then(result => {
+        if (!result) return;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
       })
       .catch(err => {
         console.error('[TTS-offline] synthesize error:', err.message);

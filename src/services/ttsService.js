@@ -12,6 +12,7 @@ class TTSService {
     this.onProgress = null;
     this.onStateChange = null;
     this.currentAudio = null;
+    this.prefetchCache = new Map();
 
     this.fallbackVoices = [
       { voiceURI: 'sv-nu-bac',  name: 'VN Giong Nu - Mien Bac',  lang: 'vi-VN', isFallback: true, pitch: 1.4, rateBoost: 1.0  },
@@ -181,6 +182,7 @@ class TTSService {
       this.currentAudio = null;
     }
     this.synth.cancel();
+    this.prefetchCache.clear(); // Clear prefetch cache when manually skipping or seeking
   }
 
   _speakCurrent() {
@@ -190,11 +192,16 @@ class TTSService {
       return;
     }
     if (this.onProgress) this.onProgress(this.currentIndex, this.chunks.length);
-    const text = this.chunks[this.currentIndex];
+    
+    // Fire background prefetch for the NEXT chunk
+    if (this.currentIndex + 1 < this.chunks.length && this.voice?.isFallback) {
+       this._getPrefetchPromises(this.currentIndex + 1);
+    }
+    
     if (this.voice?.isFallback) {
-      this._speakWebSpeechFallback(text, () => this._onChunkDone());
+      this._speakEdgeTTSBackend(this.currentIndex, () => this._onChunkDone());
     } else {
-      this._speakWebSpeech(text, () => this._onChunkDone());
+      this._speakWebSpeech(this.chunks[this.currentIndex], () => this._onChunkDone());
     }
   }
 
@@ -229,35 +236,113 @@ class TTSService {
     next();
   }
 
-  _speakWebSpeechFallback(paragraphText, onDone) {
-    const MAX = 800;
+  _getPrefetchPromises(index) {
+    if (this.prefetchCache.has(index)) {
+      return this.prefetchCache.get(index);
+    }
+    const paragraphText = this.chunks[index];
+    const MAX = 400; 
     const subChunks = paragraphText.length <= MAX
       ? [paragraphText]
       : this.splitParagraphForFallback(paragraphText, MAX);
 
-    const profile     = this.voice;
-    const systemVoices = this.synth.getVoices();
-    const isNu        = profile?.voiceURI?.includes('nu');
-    const viVoices    = systemVoices.filter(v => (v.lang || '').startsWith('vi'));
-    let bestVoice     = null;
-    if (viVoices.length > 0) {
-      bestVoice = isNu
-        ? (viVoices.find(v => v.name.toLowerCase().includes('hoai') || v.name.toLowerCase().includes('my') || v.name.toLowerCase().includes('linh')) || viVoices[0])
-        : (viVoices.find(v => v.name.toLowerCase().includes('nam')  || v.name.toLowerCase().includes('minh')) || viVoices[0]);
-    }
+    const voiceName = this._getSAPIVoiceName();
+    
+    const fetchPromises = subChunks.map(text => 
+      fetch('/offline/synthesize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voiceName, rate: this.rate }),
+      }).then(async r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const data = await r.json();
+        if (!data.audioBase64) throw new Error('Empty audio');
+        return data;
+      }).catch(err => {
+        console.error('Prefetch error', err);
+        return null;
+      })
+    );
+    this.prefetchCache.set(index, { subChunks, fetchPromises });
+    return this.prefetchCache.get(index);
+  }
+
+  async _speakEdgeTTSBackend(index, onDone) {
+    if (!this.isPlaying) { onDone(); return; }
+    
+    const { subChunks, fetchPromises } = this._getPrefetchPromises(index);
+    // Cleanup cache to avoid memory leaks
+    this.prefetchCache.delete(index);
 
     let idx = 0;
-    const next = () => {
+
+    const next = async () => {
       if (!this.isPlaying || idx >= subChunks.length) { onDone(); return; }
-      const utt = new SpeechSynthesisUtterance(subChunks[idx]);
-      utt.lang  = 'vi-VN';
-      if (bestVoice) utt.voice = bestVoice;
-      utt.pitch  = profile?.pitch    ?? 1.0;
-      utt.rate   = this.rate * (profile?.rateBoost ?? 1.0);
-      utt.onend  = () => { idx++; next(); };
-      utt.onerror = (e) => { console.error('TTS fallback error:', e); onDone(); };
-      this.synth.speak(utt);
+      
+      try {
+        // Chỉ việc đợi kết quả đã tải sẵn
+        const data = await fetchPromises[idx];
+        
+        // Parse VTT to get cues array: [{ start: 0.1, end: 0.5, word: 'Ngày' }, ...]
+        let cues = [];
+        if (data.vtt) {
+          const lines = data.vtt.split('\n');
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line.includes('-->')) {
+              const times = line.split('-->').map(t => t.trim());
+              const parseTime = (t) => {
+                const [hms, ms] = t.split('.');
+                const [h, m, s] = hms.split(':').map(Number);
+                return h * 3600 + m * 60 + s + (ms ? Number(ms) / 1000 : 0);
+              };
+              if (times.length === 2 && i + 1 < lines.length) {
+                cues.push({
+                  start: parseTime(times[0]),
+                  end: parseTime(times[1]),
+                  word: lines[i+1].trim()
+                });
+              }
+            }
+          }
+        }
+        
+        const audio = new Audio("data:audio/mp3;base64," + data.audioBase64);
+        this.currentAudio = audio;
+        
+        // Time update for Karaoke Mode
+        if (cues.length > 0) {
+          audio.ontimeupdate = () => {
+            const t = audio.currentTime;
+            const currentCue = cues.find(c => t >= c.start && t <= c.end);
+            if (currentCue && this.onKaraokeCue) {
+              this.onKaraokeCue(currentCue.word);
+            }
+          };
+        }
+        
+        audio.onended = () => {
+          this.currentAudio = null;
+          if (this.onKaraokeCue) this.onKaraokeCue(''); // clear highlight
+          idx++;
+          next();
+        };
+        audio.onerror = (e) => {
+          console.error('Audio playback error', e);
+          this.currentAudio = null;
+          if (this.onKaraokeCue) this.onKaraokeCue('');
+          idx++;
+          next(); 
+        };
+        
+        await audio.play();
+      } catch (err) {
+        console.error('EdgeTTS backend play error:', err);
+        idx++;
+        next();
+      }
     };
+    
     next();
   }
 
@@ -267,24 +352,18 @@ class TTSService {
 
   // ─── Download Audio ─────────────────────────────────────────────────────────
 
-  async downloadAudio(text, mode, fileName, onProgress) {
+  async downloadAudio(text, mode, fileName, onProgress, silenceDuration = 0, exportSrt = false) {
     const chunks = this.chunkText(text);
     if (chunks.length === 0) throw new Error('Khong co noi dung de tai xuong.');
 
     if (mode === 'offline') {
-      return this._downloadOfflineSAPI(chunks, fileName, onProgress);
+      return this._downloadOfflineSAPI(chunks, fileName, onProgress, silenceDuration, exportSrt);
     } else {
       return this._downloadOnline(chunks, fileName, onProgress);
     }
   }
 
-  // ── OFFLINE (SAPI) ──────────────────────────────────────────────────────────
-  // Phuong phap: goi Windows SAPI qua endpoint /offline/synthesize (Node/PowerShell)
-  // - Xu ly song song theo so luong CPU de toi da toc do
-  // - Tong hop am thanh WAV im lang, khong phat qua loa
-  // - Lay MP3 truc tiep tu edge-tts backend (giong Viet Neural chinh xac)
-
-  async _downloadOfflineSAPI(chunks, fileName, onProgress) {
+  async _downloadOfflineSAPI(chunks, fileName, onProgress, silenceDuration = 0, exportSrt = false) {
     const voiceName = this._getSAPIVoiceName();
     const rate      = this.rate;
 
@@ -292,14 +371,12 @@ class TTSService {
     const batches = this.splitParagraphForFallback(allText, 175);
     const total   = batches.length;
 
-    // Gioi han concurrency o 3 de tranh bi Microsoft rate-limit (NoAudioReceived)
     const concurrency = Math.max(1, Math.min(navigator.hardwareConcurrency || 2, 3));
-    console.log(`[EdgeTTS-offline] Tong hop: ${total} batch. Song song: ${concurrency} luong. Giong: ${voiceName}`);
+    console.log(`[EdgeTTS-offline] Tong hop: ${total} batch. Song song: ${concurrency} luong. Silence: ${silenceDuration}s. SRT: ${exportSrt}`);
 
     let completed = 0;
-    const mp3Results = new Array(total).fill(null);
+    const results = new Array(total).fill(null);
 
-    // Ham goi backend edge-tts de lay MP3 truc tiep
     const synthesizeMp3 = async (text, idx) => {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -312,9 +389,14 @@ class TTSService {
             const errBody = await resp.json().catch(() => ({}));
             throw new Error(errBody.error || 'HTTP ' + resp.status);
           }
-          const buf = await resp.arrayBuffer();
-          if (buf.byteLength < 100) throw new Error('MP3 qua ngan');
-          return new Uint8Array(buf);
+          const data = await resp.json();
+          if (!data.audioBase64) throw new Error('Empty audioBase64');
+          
+          const binary = atob(data.audioBase64);
+          const buf = new Uint8Array(binary.length);
+          for(let i=0; i<binary.length; i++) buf[i] = binary.charCodeAt(i);
+          
+          return { audioBuf: buf, vttText: data.vtt || '', originalText: text };
         } catch (err) {
           if (attempt === 2) {
             console.warn(`[EdgeTTS] Bo qua batch ${idx}: ${err.message}`);
@@ -326,27 +408,24 @@ class TTSService {
       return null;
     };
 
-    // Chay song song nhieu luong
     let queueIdx = 0;
     const workerPipeline = async (workerIdx) => {
-      // Stagger worker starts de tranh burst request cung luc
       await new Promise(r => setTimeout(r, workerIdx * 200));
       while (queueIdx < total) {
         const i = queueIdx++;
-        const mp3Buf = await synthesizeMp3(batches[i], i);
-        mp3Results[i] = mp3Buf;
+        const res = await synthesizeMp3(batches[i], i);
+        results[i] = res;
         completed++;
         const pct = Math.round((completed / total) * 95);
         onProgress && onProgress(pct);
-        // Delay nho giua cac request de tranh rate-limit
         if (queueIdx < total) await new Promise(r => setTimeout(r, 150));
       }
     };
 
     await Promise.all(Array.from({ length: concurrency }, (_, idx) => workerPipeline(idx)));
 
-    const validMp3s = mp3Results.filter(Boolean);
-    if (validMp3s.length === 0) {
+    const validResults = results.filter(Boolean);
+    if (validResults.length === 0) {
       throw new Error(
         'Khong the tong hop am thanh. Kiem tra:\n' +
         '- Ket noi internet (edge-tts can internet lan dau)\n' +
@@ -357,21 +436,82 @@ class TTSService {
 
     onProgress && onProgress(98);
 
-    // Ghep tat ca MP3 buffer thanh 1 file duy nhat
-    const totalLength = validMp3s.reduce((sum, b) => sum + b.length, 0);
-    const merged = new Uint8Array(totalLength);
+    // Chuan bi Silence Buffer (1s)
+    let silenceBuf = null;
+    if (silenceDuration > 0) {
+      const b64 = "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU2LjM2LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU2LjQxAAAAAAAAAAAAAAAAJAAAAAAAAAAAASDs90hvAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV";
+      const bin = atob(b64);
+      silenceBuf = new Uint8Array(bin.length);
+      for(let i=0; i<bin.length; i++) silenceBuf[i] = bin.charCodeAt(i);
+    }
+
+    let totalAudioLength = 0;
+    for (const res of validResults) {
+      totalAudioLength += res.audioBuf.length;
+      if (silenceDuration > 0 && silenceBuf) {
+        totalAudioLength += silenceBuf.length * silenceDuration;
+      }
+    }
+
+    const merged = new Uint8Array(totalAudioLength);
     let offset = 0;
-    for (const buf of validMp3s) {
-      merged.set(buf, offset);
-      offset += buf.length;
+    
+    let srtContent = "";
+    let srtIndex = 1;
+    let currentOffsetMs = 0;
+
+    for (const res of validResults) {
+      merged.set(res.audioBuf, offset);
+      offset += res.audioBuf.length;
+      
+      let chunkDurationMs = 0;
+      if (exportSrt) {
+        chunkDurationMs = Math.round((res.audioBuf.length / 32000) * 1000); // estimate
+        if (res.vttText) {
+          const matches = [...res.vttText.matchAll(/(\d{2}):(\d{2}):(\d{2})\.(\d{3})/g)];
+          if (matches.length > 0) {
+            const lastMatch = matches[matches.length - 1];
+            chunkDurationMs = (parseInt(lastMatch[1])*3600000) + (parseInt(lastMatch[2])*60000) + (parseInt(lastMatch[3])*1000) + parseInt(lastMatch[4]);
+          }
+        }
+        
+        const startTimeStr = this._msToSrtTime(currentOffsetMs);
+        const endTimeStr = this._msToSrtTime(currentOffsetMs + chunkDurationMs);
+        
+        srtContent += `${srtIndex}\n${startTimeStr} --> ${endTimeStr}\n${res.originalText}\n\n`;
+        srtIndex++;
+      }
+      currentOffsetMs += chunkDurationMs;
+
+      if (silenceDuration > 0 && silenceBuf) {
+        for (let s = 0; s < silenceDuration; s++) {
+          merged.set(silenceBuf, offset);
+          offset += silenceBuf.length;
+          currentOffsetMs += 1000;
+        }
+      }
     }
 
     const blob = new Blob([merged], { type: 'audio/mpeg' });
     const outName = fileName.replace(/\.[^.]+$/, '.mp3');
     this._triggerDownload(blob, outName);
-    onProgress && onProgress(100);
+    
+    if (exportSrt && srtContent) {
+      const srtBlob = new Blob([srtContent], { type: 'text/plain;charset=utf-8' });
+      const srtOutName = fileName.replace(/\.[^.]+$/, '.srt');
+      this._triggerDownload(srtBlob, srtOutName);
+    }
 
+    onProgress && onProgress(100);
     console.log('[EdgeTTS-offline] Hoan thanh 100%! MP3 size:', (blob.size / 1024 / 1024).toFixed(2), 'MB');
+  }
+
+  _msToSrtTime(msTotal) {
+    const h = Math.floor(msTotal / 3600000).toString().padStart(2, '0');
+    const m = Math.floor((msTotal % 3600000) / 60000).toString().padStart(2, '0');
+    const s = Math.floor((msTotal % 60000) / 1000).toString().padStart(2, '0');
+    const ms = (msTotal % 1000).toString().padStart(3, '0');
+    return `${h}:${m}:${s},${ms}`;
   }
 
 
