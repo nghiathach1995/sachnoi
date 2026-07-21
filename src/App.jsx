@@ -1,12 +1,18 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Settings, Play, Pause, SkipBack, SkipForward, File, Upload, CheckCircle, XCircle, Clock, Loader, Folder, Volume2, Music, FileText, Headphones, FileDown, Download, Wifi, WifiOff } from 'lucide-react';
-import { get, set } from 'idb-keyval';
+import { Settings, Play, Pause, SkipBack, SkipForward, File, Upload, CheckCircle, XCircle, Clock, Loader, Folder, Volume2, Music, FileText, Headphones, FileDown, Download, Wifi, WifiOff, RotateCcw } from 'lucide-react';
+import { get, set, del } from 'idb-keyval';
 import { parseFile } from './services/fileParser';
 import ttsService from './services/ttsService';
 
 // File extensions supported
-const SUPPORTED_EXTS = ['.txt', '.pdf', '.epub'];
+const SUPPORTED_EXTS = ['.txt', '.pdf', '.epub', '.docx'];
 const isSupportedFile = (name) => SUPPORTED_EXTS.some(ext => name.toLowerCase().endsWith(ext));
+
+const BGM_TRACKS = [
+  { id: 'lofi', name: 'Lofi Chill (Miễn phí bản quyền)', url: 'https://cdn.pixabay.com/download/audio/2022/05/27/audio_1808fbf07a.mp3?filename=lofi-study-112191.mp3' },
+  { id: 'piano', name: 'Piano Nhẹ nhàng (Miễn phí)', url: 'https://cdn.pixabay.com/download/audio/2022/11/22/audio_febc508520.mp3?filename=piano-moment-9835.mp3' },
+  { id: 'rain', name: 'Tiếng Mưa (Miễn phí)', url: 'https://cdn.pixabay.com/download/audio/2021/08/09/audio_88c4493bc6.mp3?filename=soft-rain-ambient-111154.mp3' }
+];
 
 function App() {
   const [voices, setVoices] = useState([]);
@@ -57,6 +63,8 @@ function App() {
   // New features state
   const [karaokeWord, setKaraokeWord] = useState('');
   const [bgmEnabled, setBgmEnabled] = useState(false);
+  const [bgmTrackId, setBgmTrackId] = useState('lofi');
+  const [bgmVolume, setBgmVolume] = useState(1.0); // 0.0 to 1.0 multiplier
   const bgmRef = useRef(null);
 
   useEffect(() => {
@@ -76,10 +84,6 @@ function App() {
 
     ttsService.onStateChange = (playing) => {
       setIsPlaying(playing);
-      // Audio ducking for BGM
-      if (bgmRef.current) {
-        bgmRef.current.volume = playing ? 0.1 : 0.4;
-      }
     };
     ttsService.onProgress = (current, total) => {
       setProgress({ current, total });
@@ -96,6 +100,15 @@ function App() {
     
     return () => ttsService.stop();
   }, [uploadedFileName]);
+
+  // Handle BGM volume ducking
+  useEffect(() => {
+    if (bgmRef.current) {
+      // Khi AI đang nói (isPlaying = true), nhạc nền hạ xuống mức siêu nhỏ (3% * volume gốc)
+      // Khi AI ngưng nói, nhạc nền lên mức vừa phải (25% * volume gốc)
+      bgmRef.current.volume = isPlaying ? (0.03 * bgmVolume) : (0.25 * bgmVolume);
+    }
+  }, [isPlaying, bgmVolume]);
 
   useEffect(() => {
     ttsService.setSettings(selectedVoice, rate, pitch);
@@ -210,6 +223,16 @@ function App() {
   }, []);
 
   // ─── Playback ──────────────────────────────────────────────────────────────
+  const handleResetBookmark = async () => {
+    if (!uploadedFileName) return;
+    try {
+      await del(`bookmark-${uploadedFileName}`);
+      ttsService.seek(0);
+    } catch(e) {
+      console.error('Error deleting bookmark', e);
+    }
+  };
+
   const togglePlay = () => {
     if (isPlaying) ttsService.pause();
     else {
@@ -540,9 +563,11 @@ function App() {
               <label>Cao độ: {pitch.toFixed(1)}</label>
               <input type="range" min="0" max="2" step="0.1" value={pitch} onChange={(e) => setPitch(parseFloat(e.target.value))} />
             </div>
-              <div className="settings-group">
-                <label>Nhạc nền (Lofi)</label>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <div className="settings-group" style={{ background: 'rgba(0,0,0,0.1)', padding: '1rem', borderRadius: '0.75rem', marginTop: '1rem' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem', fontWeight: 600 }}>
+                  <Music size={18} color="var(--accent-primary)" /> Nhạc nền (Không bản quyền)
+                </label>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1rem' }}>
                   <input 
                     type="checkbox" 
                     id="bgmToggle"
@@ -554,19 +579,71 @@ function App() {
                     }}
                     style={{ width: '18px', height: '18px', accentColor: 'var(--accent-primary)' }}
                   />
-                  <label htmlFor="bgmToggle" style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer', margin: 0, fontSize: '0.9rem' }}>
-                    <Music size={16} color="var(--accent-primary)" /> Bật nhạc nền thư giãn
+                  <label htmlFor="bgmToggle" style={{ cursor: 'pointer', margin: 0, fontSize: '0.9rem' }}>
+                    Bật phát nhạc nền thư giãn
                   </label>
                 </div>
+                
+                {bgmEnabled && (
+                  <>
+                    <select 
+                      value={bgmTrackId} 
+                      onChange={(e) => {
+                        setBgmTrackId(e.target.value);
+                        if (bgmRef.current && bgmEnabled) {
+                          // Allow audio to update source then play
+                          setTimeout(() => bgmRef.current.play().catch(console.log), 50);
+                        }
+                      }}
+                      style={{ marginBottom: '1rem', fontSize: '0.9rem' }}
+                    >
+                      {BGM_TRACKS.map(track => (
+                        <option key={track.id} value={track.id}>{track.name}</option>
+                      ))}
+                    </select>
+
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                      <label style={{ fontSize: '0.85rem', display: 'flex', justifyContent: 'space-between' }}>
+                        <span>Âm lượng nhạc</span>
+                        <span>{Math.round(bgmVolume * 100)}%</span>
+                      </label>
+                      <input 
+                        type="range" 
+                        min="0" max="2" step="0.1" 
+                        value={bgmVolume} 
+                        onChange={(e) => setBgmVolume(parseFloat(e.target.value))} 
+                      />
+                    </div>
+                  </>
+                )}
               </div>
             </div>
             {/* Hidden BGM Audio Tag */}
-            <audio ref={bgmRef} loop src="https://cdn.pixabay.com/download/audio/2022/05/27/audio_1808fbf07a.mp3?filename=lofi-study-112191.mp3" />
+            <audio 
+              ref={bgmRef} 
+              loop 
+              src={BGM_TRACKS.find(t => t.id === bgmTrackId)?.url || BGM_TRACKS[0].url} 
+            />
 
           {/* ─── Floating Player & Reading Panel ───────────────────────────── */}
           <div className="glass-panel floating-player-container" style={{ flex: 2, display: 'flex', flexDirection: 'column', paddingBottom: '80px', position: 'relative' }}>
-            <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1rem' }}>
-              <File size={24} /> Đang đọc (Karaoke Mode)
+            <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1rem', justifyContent: 'space-between' }}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <File size={24} /> Đang đọc (Karaoke Mode)
+              </span>
+              <button 
+                onClick={handleResetBookmark}
+                title="Xoá lịch sử đọc (Quay lại từ đầu)"
+                disabled={progress.total === 0}
+                style={{ 
+                  background: 'transparent', border: '1px solid var(--glass-border)', color: 'var(--text-muted)', 
+                  padding: '0.4rem 0.8rem', borderRadius: '0.5rem', cursor: progress.total === 0 ? 'default' : 'pointer', 
+                  display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem',
+                  opacity: progress.total === 0 ? 0.5 : 1
+                }}
+              >
+                <RotateCcw size={14} /> Bắt đầu lại
+              </button>
             </h3>
             <div className="reading-box" style={{ flex: 1, minHeight: '300px', fontSize: '1.2rem', lineHeight: '1.8' }}>
               {currentText ? renderKaraokeText(currentText, karaokeWord) : <span style={{ color: 'var(--text-muted)' }}>Chưa có nội dung nào được phát.</span>}
