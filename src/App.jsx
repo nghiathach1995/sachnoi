@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Settings, Play, Pause, SkipBack, SkipForward, File, Upload, CheckCircle, XCircle, Clock, Loader, Folder, Volume2, Music, FileText, Headphones, FileDown, Download, Wifi, WifiOff, RotateCcw } from 'lucide-react';
+import { Settings, Play, Pause, SkipBack, SkipForward, File, Upload, CheckCircle, XCircle, Clock, Loader, Folder, Volume2, Music, FileText, Headphones, FileDown, Download, Wifi, WifiOff, RotateCcw, StopCircle } from 'lucide-react';
 import { get, set, del } from 'idb-keyval';
 import { parseFile } from './services/fileParser';
 import ttsService from './services/ttsService';
