@@ -19,6 +19,8 @@ class TTSService {
       { voiceURI: 'sv-nam-bac', name: 'VN Giong Nam - Mien Bac', lang: 'vi-VN', isFallback: true, pitch: 0.6, rateBoost: 0.95 },
       { voiceURI: 'sv-nu-nam',  name: 'VN Giong Nu - Mien Nam',  lang: 'vi-VN', isFallback: true, pitch: 1.2, rateBoost: 1.0  },
       { voiceURI: 'sv-nam-nam', name: 'VN Giong Nam - Mien Nam', lang: 'vi-VN', isFallback: true, pitch: 0.4, rateBoost: 0.95 },
+      { voiceURI: 'vi-VN-HoaiMyNeural', name: 'Microsoft Hoài My Online (Natural) - Vietnamese (Vietnam)', lang: 'vi-VN', isFallback: true, pitch: 1.0, rateBoost: 1.0 },
+      { voiceURI: 'vi-VN-NamMinhNeural', name: 'Microsoft Nam Minh Online (Natural) - Vietnamese (Vietnam)', lang: 'vi-VN', isFallback: true, pitch: 1.0, rateBoost: 1.0 }
     ];
     this.fallbackVoice = this.fallbackVoices[0];
   }
@@ -55,9 +57,13 @@ class TTSService {
   // ─── Chunking ──────────────────────────────────────────────────────────────
 
   chunkText(text) {
-    return text
+    const rawChunks = text
       .replace(/\r\n/g, '\n')
-      .split(/\n{2,}/)
+      .replace(/([.!?])\s+(?=[A-ZĐÁÀẢÃẠÂẤẦẨẪẬĂẮẰẲẴẶÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴ])/g, '$1|SPLIT|')
+      .replace(/\n+/g, '|SPLIT|')
+      .split('|SPLIT|');
+      
+    return rawChunks
       .map(p => p.replace(/\n/g, ' ').replace(/\s{2,}/g, ' ').trim())
       .filter(p => p.length > 0);
   }
@@ -209,7 +215,9 @@ class TTSService {
     if (!this.isPlaying) return;
     this.currentIndex++;
     if (this.currentIndex < this.chunks.length) {
-      this._speakCurrent();
+      setTimeout(() => {
+        if (this.isPlaying) this._speakCurrent();
+      }, 700); // 700ms pause between sentences/paragraphs
     } else {
       this.isPlaying = false;
       this.notifyState();
@@ -241,7 +249,7 @@ class TTSService {
       return this.prefetchCache.get(index);
     }
     const paragraphText = this.chunks[index];
-    const MAX = 400; 
+    const MAX = 3000; 
     const subChunks = paragraphText.length <= MAX
       ? [paragraphText]
       : this.splitParagraphForFallback(paragraphText, MAX);
@@ -367,9 +375,13 @@ class TTSService {
     const voiceName = this._getSAPIVoiceName();
     const rate      = this.rate;
 
-    const allText = chunks.join(' ');
-    const batches = this.splitParagraphForFallback(allText, 175);
-    const total   = batches.length;
+    // Use chunks directly to preserve semantic pauses (paragraphs/sentences)
+    const batches = [];
+    for (const chunk of chunks) {
+      const subChunks = this.splitParagraphForFallback(chunk, 3000);
+      batches.push(...subChunks);
+    }
+    const total = batches.length;
 
     const concurrency = Math.max(1, Math.min(navigator.hardwareConcurrency || 2, 3));
     console.log(`[EdgeTTS-offline] Tong hop: ${total} batch. Song song: ${concurrency} luong. Silence: ${silenceDuration}s. SRT: ${exportSrt}`);
@@ -436,20 +448,36 @@ class TTSService {
 
     onProgress && onProgress(98);
 
-    // Chuan bi Silence Buffer (1s)
-    let silenceBuf = null;
-    if (silenceDuration > 0) {
-      const b64 = "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU2LjM2LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU2LjQxAAAAAAAAAAAAAAAAJAAAAAAAAAAAASDs90hvAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV";
-      const bin = atob(b64);
-      silenceBuf = new Uint8Array(bin.length);
-      for(let i=0; i<bin.length; i++) silenceBuf[i] = bin.charCodeAt(i);
+    onProgress && onProgress(98);
+
+    // Chuan bi Silence Buffer (Mặc định 700ms giữa các chunks, hoặc theo tùy chọn của user)
+    const pauseMs = silenceDuration > 0 ? silenceDuration * 1000 : 700;
+    
+    // Tạo 1 giây silence buffer chuẩn
+    const b64 = "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU2LjM2LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU2LjQxAAAAAAAAAAAAAAAAJAAAAAAAAAAAASDs90hvAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV";
+    const bin = atob(b64);
+    const oneSecSilence = new Uint8Array(bin.length);
+    for(let i=0; i<bin.length; i++) oneSecSilence[i] = bin.charCodeAt(i);
+    
+    // Tính toán độ lớn buffer cho pauseMs
+    // (Vì 1 giây silenceBuf có size cố định, ta có thể tính byte length tỷ lệ thuận)
+    const byteRate = oneSecSilence.length; // bytes per second
+    const silenceBufLength = Math.floor(byteRate * (pauseMs / 1000));
+    const silenceBuf = new Uint8Array(silenceBufLength);
+    // Fill with zero to create silent mp3 frame data? No, mp3 is not just zeros.
+    // Dùng frame silence lặp lại
+    let offsetS = 0;
+    while(offsetS < silenceBufLength) {
+      const chunk = oneSecSilence.subarray(0, Math.min(oneSecSilence.length, silenceBufLength - offsetS));
+      silenceBuf.set(chunk, offsetS);
+      offsetS += chunk.length;
     }
 
     let totalAudioLength = 0;
-    for (const res of validResults) {
-      totalAudioLength += res.audioBuf.length;
-      if (silenceDuration > 0 && silenceBuf) {
-        totalAudioLength += silenceBuf.length * silenceDuration;
+    for (let i = 0; i < validResults.length; i++) {
+      totalAudioLength += validResults[i].audioBuf.length;
+      if (i < validResults.length - 1) {
+        totalAudioLength += silenceBuf.length;
       }
     }
 
@@ -460,7 +488,8 @@ class TTSService {
     let srtIndex = 1;
     let currentOffsetMs = 0;
 
-    for (const res of validResults) {
+    for (let i = 0; i < validResults.length; i++) {
+      const res = validResults[i];
       merged.set(res.audioBuf, offset);
       offset += res.audioBuf.length;
       
@@ -483,12 +512,10 @@ class TTSService {
       }
       currentOffsetMs += chunkDurationMs;
 
-      if (silenceDuration > 0 && silenceBuf) {
-        for (let s = 0; s < silenceDuration; s++) {
-          merged.set(silenceBuf, offset);
-          offset += silenceBuf.length;
-          currentOffsetMs += 1000;
-        }
+      if (i < validResults.length - 1) {
+        merged.set(silenceBuf, offset);
+        offset += silenceBuf.length;
+        currentOffsetMs += pauseMs;
       }
     }
 
@@ -523,6 +550,8 @@ class TTSService {
     // Fallback profiles map
     if (!this.voice || this.voice.isFallback) {
       const uri = this.voice ? this.voice.voiceURI : '';
+      if (uri === 'vi-VN-HoaiMyNeural') return 'vi-VN-HoaiMyNeural';
+      if (uri === 'vi-VN-NamMinhNeural') return 'vi-VN-NamMinhNeural';
       // fallback voices: sv-nu-bac, sv-nu-nam => female, sv-nam-bac, sv-nam-nam => male
       if (uri.includes('nu')) return 'vi-VN-HoaiMyNeural';
       if (uri.includes('nam')) return 'vi-VN-NamMinhNeural';
@@ -567,8 +596,11 @@ class TTSService {
     const MAX_RETRY  = 2;
     let failCount    = 0;
 
-    const allText = chunks.join(' ');
-    const batches  = this.splitParagraphForFallback(allText, MAX_BATCH);
+    const allBatches = [];
+    for (const chunk of chunks) {
+      allBatches.push(...this.splitParagraphForFallback(chunk, MAX_BATCH));
+    }
+    const batches = allBatches;
     console.log('[TTS-online] ' + batches.length + ' batch');
 
     for (let i = 0; i < batches.length; i++) {
@@ -606,10 +638,37 @@ class TTSService {
     }
 
     onProgress && onProgress(95);
-    const totalLength = mp3Buffers.reduce((sum, b) => sum + b.length, 0);
+    
+    // Tạo buffer silence 700ms
+    const b64 = "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU2LjM2LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU2LjQxAAAAAAAAAAAAAAAAJAAAAAAAAAAAASDs90hvAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV";
+    const bin = atob(b64);
+    const oneSecSilence = new Uint8Array(bin.length);
+    for(let i=0; i<bin.length; i++) oneSecSilence[i] = bin.charCodeAt(i);
+    const silenceBufLength = Math.floor(oneSecSilence.length * 0.7);
+    const silenceBuf = new Uint8Array(silenceBufLength);
+    let offsetS = 0;
+    while(offsetS < silenceBufLength) {
+      const chunk = oneSecSilence.subarray(0, Math.min(oneSecSilence.length, silenceBufLength - offsetS));
+      silenceBuf.set(chunk, offsetS);
+      offsetS += chunk.length;
+    }
+
+    let totalLength = 0;
+    for (let i = 0; i < mp3Buffers.length; i++) {
+      totalLength += mp3Buffers[i].length;
+      if (i < mp3Buffers.length - 1) totalLength += silenceBuf.length;
+    }
+    
     const merged = new Uint8Array(totalLength);
     let offset = 0;
-    for (const buf of mp3Buffers) { merged.set(buf, offset); offset += buf.length; }
+    for (let i = 0; i < mp3Buffers.length; i++) {
+      merged.set(mp3Buffers[i], offset); 
+      offset += mp3Buffers[i].length;
+      if (i < mp3Buffers.length - 1) {
+        merged.set(silenceBuf, offset);
+        offset += silenceBuf.length;
+      }
+    }
     const blob    = new Blob([merged], { type: 'audio/mpeg' });
     const outName = fileName.replace(/\.[^.]+$/, '.mp3');
     this._triggerDownload(blob, outName);

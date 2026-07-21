@@ -108,15 +108,33 @@ async function synthesizeMp3(text, voiceName, webRate = 1) {
   const rateStr = (ratePct >= 0 ? '+' : '') + ratePct + '%';
 
   // Sanitize text: remove control chars, trim
-  const cleanText = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ').trim();
+  let cleanText = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ').trim();
   if (!cleanText) throw new Error('Text rong sau khi xu ly');
+
+  // Escape XML chars manually
+  cleanText = cleanText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // Regex for valid Vietnamese syllable
+  const vnSyllableRegex = /^(b|c|ch|d|đ|g|gh|gi|h|k|kh|l|m|n|ng|ngh|nh|p|ph|q|qu|r|s|t|th|tr|v|x)?([aáàảãạăắằẳẵặâấầẩẫậeéèẻẽẹêếềểễệiíìỉĩịoóòỏõọôốồổỗộơớờởỡợuúùủũụưứừửữựyýỳỷỹỵ]+)(c|ch|m|n|ng|nh|p|t)?$/i;
+
+  // Wrap foreign words in <lang xml:lang="en-US">
+  cleanText = cleanText.replace(/[a-zA-ZÀ-ỹĐđ]+/g, (word) => {
+    if (vnSyllableRegex.test(word)) {
+      return word; // Is Vietnamese (or looks exactly like a VN syllable)
+    } else {
+      return `<lang xml:lang="en-US">${word}</lang>`; // Is foreign/English
+    }
+  });
+
+  // Construct full SSML
+  const ssmlContent = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='vi-VN'><voice name='${edgeVoiceId}'><prosody rate='${rateStr}'>${cleanText}</prosody></voice></speak>`;
 
   const id      = crypto.randomBytes(8).toString('hex');
   const tmpDir  = os.tmpdir();
   const txtFile = path.join(tmpDir, `tts_in_${id}.txt`);
   const mp3File = path.join(tmpDir, `tts_out_${id}.mp3`);
 
-  fs.writeFileSync(txtFile, cleanText, 'utf8');
+  fs.writeFileSync(txtFile, ssmlContent, 'utf8');
 
   // Build Python script for edge-tts
   const escapedTxt = txtFile.replace(/\\/g, '\\\\');
@@ -128,12 +146,19 @@ from edge_tts.submaker import SubMaker
 
 async def main():
     with open(r'${escapedTxt}', 'r', encoding='utf-8') as f:
-        text = f.read().strip()
-    if not text:
+        ssml = f.read().strip()
+    if not ssml:
         print('SKIP_EMPTY')
         return
         
-    communicate = edge_tts.Communicate(text, '${edgeVoiceId}', rate='${rateStr}')
+    class SSMLCommunicate(edge_tts.Communicate):
+        def __init__(self, ssml_str, **kwargs):
+            super().__init__("", **kwargs)
+            self.ssml = ssml_str
+        def mkssml(self) -> str:
+            return self.ssml
+
+    communicate = SSMLCommunicate(ssml, voice='${edgeVoiceId}')
     submaker = SubMaker()
     
     with open(r'${escapedMp3}', "wb") as f:
