@@ -111,23 +111,31 @@ async function synthesizeMp3(text, voiceName, webRate = 1) {
   let cleanText = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ').trim();
   if (!cleanText) throw new Error('Text rong sau khi xu ly');
 
-  // Escape XML chars manually
-  cleanText = cleanText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
   // Regex for valid Vietnamese syllable
   const vnSyllableRegex = /^(b|c|ch|d|đ|g|gh|gi|h|k|kh|l|m|n|ng|ngh|nh|p|ph|q|qu|r|s|t|th|tr|v|x)?([aáàảãạăắằẳẵặâấầẩẫậeéèẻẽẹêếềểễệiíìỉĩịoóòỏõọôốồổỗộơớờởỡợuúùủũụưứừửữựyýỳỷỹỵ]+)(c|ch|m|n|ng|nh|p|t)?$/i;
 
-  // Wrap foreign words in <lang xml:lang="en-US">
-  cleanText = cleanText.replace(/[a-zA-ZÀ-ỹĐđ]+/g, (word) => {
-    if (vnSyllableRegex.test(word)) {
-      return word; // Is Vietnamese (or looks exactly like a VN syllable)
+  function escapeXML(str) {
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+  }
+
+  let resultSSML = '';
+  // Split text into words and non-words
+  const tokens = cleanText.split(/([a-zA-ZÀ-ỹĐđ]+)/);
+  for (let token of tokens) {
+    if (!token) continue;
+    if (/[a-zA-ZÀ-ỹĐđ]+/.test(token)) {
+      if (vnSyllableRegex.test(token)) {
+        resultSSML += escapeXML(token); // Vietnamese word
+      } else {
+        resultSSML += `<lang xml:lang="en-US">${escapeXML(token)}</lang>`; // Foreign word
+      }
     } else {
-      return `<lang xml:lang="en-US">${word}</lang>`; // Is foreign/English
+      resultSSML += escapeXML(token); // Punctuation, spaces, numbers, etc
     }
-  });
+  }
 
   // Construct full SSML
-  const ssmlContent = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='vi-VN'><voice name='${edgeVoiceId}'><prosody rate='${rateStr}'>${cleanText}</prosody></voice></speak>`;
+  const ssmlContent = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='vi-VN'><voice name='${edgeVoiceId}'><prosody rate='${rateStr}'>${resultSSML}</prosody></voice></speak>`;
 
   const id      = crypto.randomBytes(8).toString('hex');
   const tmpDir  = os.tmpdir();
@@ -141,7 +149,7 @@ async function synthesizeMp3(text, voiceName, webRate = 1) {
   const escapedMp3 = mp3File.replace(/\\/g, '\\\\');
 
   const pyScript = `
-import asyncio, edge_tts, sys, base64, json
+import asyncio, edge_tts, sys, base64, json, os
 from edge_tts.submaker import SubMaker
 
 async def main():
@@ -158,26 +166,39 @@ async def main():
         def mkssml(self) -> str:
             return self.ssml
 
-    communicate = SSMLCommunicate(ssml, voice='${edgeVoiceId}')
-    submaker = SubMaker()
+    last_error = None
+    for attempt in range(4):
+        try:
+            communicate = SSMLCommunicate(ssml, voice='${edgeVoiceId}')
+            submaker = SubMaker()
+            audio_bytes = bytearray()
+            
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_bytes.extend(chunk["data"])
+                elif chunk["type"] == "WordBoundary":
+                    submaker.feed(chunk)
+            
+            if len(audio_bytes) < 100:
+                raise Exception(f"Audio too short: {len(audio_bytes)} bytes")
+            
+            with open(r'${escapedMp3}', "wb") as f:
+                f.write(audio_bytes)
+            
+            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+            vtt_text = submaker.get_srt()
+            
+            out_dict = {"audioBase64": audio_b64, "vtt": vtt_text}
+            print(json.dumps(out_dict))
+            return
+        except Exception as e:
+            last_error = str(e)
+            wait_time = (attempt + 1) * 1.5
+            sys.stderr.write(f"Attempt {attempt+1} failed: {e}, retrying in {wait_time}s\n")
+            await asyncio.sleep(wait_time)
     
-    with open(r'${escapedMp3}', "wb") as f:
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                f.write(chunk["data"])
-            elif chunk["type"] == "WordBoundary":
-                submaker.feed(chunk)
-                
-    with open(r'${escapedMp3}', "rb") as f:
-        audio_b64 = base64.b64encode(f.read()).decode('utf-8')
-        
-    vtt_text = submaker.get_srt()
-    
-    out_dict = {
-        "audioBase64": audio_b64,
-        "vtt": vtt_text
-    }
-    print(json.dumps(out_dict))
+    sys.stderr.write(f"All attempts failed: {last_error}\n")
+    sys.exit(1)
 
 asyncio.run(main())
 `.trim();
@@ -187,9 +208,14 @@ asyncio.run(main())
 
   try {
     const result = await new Promise((resolve, reject) => {
-      execFile('python', [pyFile], { timeout: 90000, encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err) reject(new Error(stderr || err.message));
-        else resolve(stdout.trim());
+      execFile('python', [pyFile], { timeout: 120000, encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          const errMsg = stderr ? stderr.trim() : err.message;
+          console.error('[TTS-offline] Python error:', errMsg.substring(0, 300));
+          reject(new Error(errMsg));
+        } else {
+          resolve(stdout.trim());
+        }
       });
     });
 
@@ -197,10 +223,18 @@ asyncio.run(main())
       return { audioBase64: '', vtt: '' };
     }
     
+    if (!result) {
+      throw new Error('Python script produced no output');
+    }
+
     try {
-      return JSON.parse(result);
+      const parsed = JSON.parse(result);
+      if (!parsed.audioBase64 || parsed.audioBase64.length < 10) {
+        throw new Error('Empty audioBase64 in response');
+      }
+      return parsed;
     } catch (e) {
-      throw new Error("Invalid output from python: " + result.substring(0, 200));
+      throw new Error('Invalid output from python: ' + result.substring(0, 200));
     }
   } finally {
     for (const f of [txtFile, pyFile, mp3File]) {

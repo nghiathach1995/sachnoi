@@ -383,14 +383,15 @@ class TTSService {
     }
     const total = batches.length;
 
-    const concurrency = Math.max(1, Math.min(navigator.hardwareConcurrency || 2, 3));
-    console.log(`[EdgeTTS-offline] Tong hop: ${total} batch. Song song: ${concurrency} luong. Silence: ${silenceDuration}s. SRT: ${exportSrt}`);
+    const CONCURRENCY = 1; // Sequential to avoid rate limiting from Microsoft Edge TTS
+    const DELAY_BETWEEN_MS = 600; // ms between requests
+    console.log(`[EdgeTTS-offline] Tong hop: ${total} batch. Song song: ${CONCURRENCY} luong (sequential). Silence: ${silenceDuration}s. SRT: ${exportSrt}`);
 
     let completed = 0;
     const results = new Array(total).fill(null);
 
     const synthesizeMp3 = async (text, idx) => {
-      for (let attempt = 0; attempt < 3; attempt++) {
+      for (let attempt = 0; attempt < 4; attempt++) {
         try {
           const resp = await fetch('/offline/synthesize', {
             method: 'POST',
@@ -402,7 +403,7 @@ class TTSService {
             throw new Error(errBody.error || 'HTTP ' + resp.status);
           }
           const data = await resp.json();
-          if (!data.audioBase64) throw new Error('Empty audioBase64');
+          if (!data.audioBase64 || data.audioBase64.length < 10) throw new Error('Empty audioBase64');
           
           const binary = atob(data.audioBase64);
           const buf = new Uint8Array(binary.length);
@@ -410,15 +411,17 @@ class TTSService {
           
           return { audioBuf: buf, vttText: data.vtt || '', originalText: text };
         } catch (err) {
-          if (attempt === 2) {
+          if (attempt === 3) {
             console.warn(`[EdgeTTS] Bo qua batch ${idx}: ${err.message}`);
           } else {
-            await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
           }
         }
       }
       return null;
     };
+
+    let skippedCount = 0;
 
     let queueIdx = 0;
     const workerPipeline = async (workerIdx) => {
@@ -427,22 +430,33 @@ class TTSService {
         const i = queueIdx++;
         const res = await synthesizeMp3(batches[i], i);
         results[i] = res;
+        if (!res) skippedCount++;
         completed++;
-        const pct = Math.round((completed / total) * 95);
+        const pct = Math.round((completed / total) * 93);
         onProgress && onProgress(pct);
-        if (queueIdx < total) await new Promise(r => setTimeout(r, 150));
+        if (queueIdx < total) await new Promise(r => setTimeout(r, DELAY_BETWEEN_MS));
       }
     };
 
-    await Promise.all(Array.from({ length: concurrency }, (_, idx) => workerPipeline(idx)));
+    await Promise.all(Array.from({ length: CONCURRENCY }, (_, idx) => workerPipeline(idx)));
 
     const validResults = results.filter(Boolean);
+    const skipRate = skippedCount / total;
+    console.log(`[EdgeTTS-offline] Hoan thanh: ${validResults.length}/${total} batch thanh cong, ${skippedCount} bi bo qua (${(skipRate*100).toFixed(1)}%)`);
+    
     if (validResults.length === 0) {
       throw new Error(
         'Khong the tong hop am thanh. Kiem tra:\n' +
-        '- Ket noi internet (edge-tts can internet lan dau)\n' +
+        '- Ket noi internet (edge-tts can internet)\n' +
         '- Python va edge-tts da cai dat dung cach\n' +
         '- Vite dev server dang chay'
+      );
+    }
+    
+    if (skipRate > 0.15) {
+      throw new Error(
+        `Tong hop that bai: ${skippedCount}/${total} doan bi loi (${(skipRate*100).toFixed(0)}%).\n` +
+        'Co the do ket noi internet khong on dinh. Hay thu lai sau.'
       );
     }
 
