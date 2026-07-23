@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Settings, Play, Pause, SkipBack, SkipForward, File, Upload, CheckCircle, XCircle, Clock, Loader, Folder, Volume2, Music, FileText, Headphones, FileDown, Download, Wifi, WifiOff, RotateCcw, StopCircle } from 'lucide-react';
+import { Settings, Play, Pause, SkipBack, SkipForward, File, Upload, CheckCircle, XCircle, Clock, Loader, Folder, Volume2, Music, FileText, Headphones, FileDown, Download, Wifi, WifiOff, RotateCcw, StopCircle, Cpu } from 'lucide-react';
 import { get, set, del } from 'idb-keyval';
 import { parseFile } from './services/fileParser';
 import ttsService from './services/ttsService';
@@ -148,20 +148,52 @@ function App() {
   };
 
   // ─── Folder handler ────────────────────────────────────────────────────────
-  const handleFolder = (files) => {
+  const handleFolder = async (files) => {
     // files: FileList từ input[webkitdirectory] hoặc DataTransfer
-    const validFiles = Array.from(files)
-      .filter(f => isSupportedFile(f.name))
+    const allFilesArray = Array.from(files);
+    
+    let folderNamePart = 'Thư mục';
+    const firstFileWithPath = allFilesArray.find(f => f.webkitRelativePath);
+    if (firstFileWithPath) {
+      folderNamePart = firstFileWithPath.webkitRelativePath.split('/')[0];
+    }
+
+    // Đọc lịch sử các file đã xuất thành công từ idb-keyval (tránh mất điện)
+    const historyKey = `exported-${folderNamePart}`;
+    const exportedHistory = (await get(historyKey)) || [];
+    const exportedSet = new Set(exportedHistory);
+
+    // Tìm danh sách các file MP3 đã có sẵn trong thư mục (nếu upload thư mục có chứa mp3)
+    const mp3BaseNames = new Set(
+      allFilesArray
+        .filter(f => f.name.toLowerCase().endsWith('.mp3'))
+        .map(f => f.name.replace(/\.mp3$/i, ''))
+    );
+
+    let skippedCount = 0;
+    const validFiles = allFilesArray
+      .filter(f => {
+        if (!isSupportedFile(f.name)) return false;
+        // Bỏ qua nếu đã có file mp3 tương ứng hoặc đã lưu trong lịch sử hoàn thành
+        const baseName = f.name.replace(/\.[^.]+$/, '');
+        if (mp3BaseNames.has(baseName) || exportedSet.has(baseName)) {
+          skippedCount++;
+          return false;
+        }
+        return true;
+      })
       .sort((a, b) => a.name.localeCompare(b.name));
 
     if (validFiles.length === 0) {
-      setError('Không tìm thấy file .txt/.pdf/.epub nào trong thư mục đã chọn.');
+      setError(`Đã bỏ qua ${skippedCount} file. Không tìm thấy file sách nào cần xử lý mới (hoặc tất cả đã được xuất MP3).`);
       return;
     }
 
     // Lấy tên thư mục từ webkitRelativePath
     const folderPath = validFiles[0].webkitRelativePath || '';
-    const folderNamePart = folderPath.split('/')[0] || 'Thư mục';
+    if (!folderNamePart || folderNamePart === 'Thư mục') {
+      folderNamePart = folderPath.split('/')[0] || 'Thư mục';
+    }
 
     setFolderMode(true);
     setFolderName(folderNamePart);
@@ -204,7 +236,9 @@ function App() {
             if (entries.length === 0) {
               // Chuyển FileSystemEntry -> File
               const filePromises = allFiles.map(e => new Promise(res => e.file(res)));
-              Promise.all(filePromises).then(files => handleFolder(files));
+              Promise.all(filePromises).then(files => {
+                handleFolder(files).catch(console.error);
+              });
             } else {
               allFiles.push(...entries.filter(en => en.isFile));
               readEntries();
@@ -289,6 +323,11 @@ function App() {
     setDownloadDone(false);
     setDownloadError(null);
 
+    // Lấy history lưu trữ IndexedDB
+    const historyKey = `exported-${folderName}`;
+    const exportedHistory = (await get(historyKey)) || [];
+    const exportedSet = new Set(exportedHistory);
+
     // Reset status
     setBatchStatus(batchFiles.map(f => ({ name: f.name, status: 'pending', progress: 0, error: null })));
 
@@ -353,6 +392,10 @@ function App() {
             silenceDuration,
             exportSrt
           );
+
+          // Lưu vào lịch sử IndexedDB ngay lập tức
+          exportedSet.add(baseName);
+          await set(historyKey, Array.from(exportedSet));
 
           setBatchStatus(prev => {
             const next = [...prev];
@@ -699,7 +742,7 @@ function App() {
               <WifiOff size={20} style={{ color: 'var(--accent-primary)' }} />
               <div>
                 <div style={{ fontWeight: 600, fontSize: '0.95rem' }}>Offline – SAPI (Im lặng)</div>
-                <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>Xuất MP3 qua Windows SAPI – không phát qua loa, dùng toàn bộ CPU</div>
+                <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>Xuất MP3 qua Edge-TTS (Cần Internet)</div>
               </div>
             </label>
 
@@ -715,6 +758,21 @@ function App() {
               <div>
                 <div style={{ fontWeight: 600, fontSize: '0.95rem' }}>Online (Google TTS)</div>
                 <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>Tải từ Google – xuất MP3, cần internet</div>
+              </div>
+            </label>
+
+            <label style={{
+              display: 'flex', alignItems: 'center', gap: '0.6rem', cursor: 'pointer',
+              padding: '0.75rem 1.25rem', borderRadius: '0.75rem',
+              border: `2px solid ${downloadMode === 'vieneu' ? 'var(--accent-primary)' : 'rgba(255,255,255,0.15)'}`,
+              background: downloadMode === 'vieneu' ? 'rgba(99,102,241,0.15)' : 'transparent',
+              transition: 'all 0.2s', flex: 1, minWidth: '180px',
+            }}>
+              <input type="radio" name="downloadMode" value="vieneu" checked={downloadMode === 'vieneu'} onChange={() => setDownloadMode('vieneu')} style={{ accentColor: 'var(--accent-primary)', width: '18px', height: '18px' }} />
+              <Cpu size={20} style={{ color: 'var(--accent-primary)' }} />
+              <div>
+                <div style={{ fontWeight: 600, fontSize: '0.95rem' }}>Local AI (VieNeu)</div>
+                <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>Sử dụng 100% CPU cục bộ (Tốc độ cao)</div>
               </div>
             </label>
           </div>
@@ -913,8 +971,8 @@ function App() {
 
           <p style={{ marginTop: '0.75rem', fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center' }}>
             {downloadMode === 'offline'
-              ? '💡 Offline SAPI: Tổng hợp im lặng qua Windows SAPI (PowerShell), dùng song song toàn bộ CPU. Không phát qua loa. Xuất MP3.'
-              : '💡 Online Google TTS: Tải audio tiếng Việt từ Google. Cần internet. Xuất MP3.'}
+              ? '💡 Offline SAPI: Tổng hợp im lặng qua Edge-TTS (Microsoft Neural Voices). Cần kết nối Internet. Xuất MP3.'
+              : '💡 Online Google TTS: Tải audio trực tiếp từ Google Translate. Phụ thuộc vào tốc độ mạng.'}
           </p>
         </div>
       </main>

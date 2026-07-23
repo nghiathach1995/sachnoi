@@ -1,4 +1,5 @@
 // Import removed: using window.lamejs from CDN in index.html to avoid "MPEGMode is not defined" error in Vite strict mode
+import { get, set, del } from 'idb-keyval';
 
 class TTSService {
   constructor() {
@@ -20,7 +21,12 @@ class TTSService {
       { voiceURI: 'sv-nu-nam',  name: 'VN Giong Nu - Mien Nam',  lang: 'vi-VN', isFallback: true, pitch: 1.2, rateBoost: 1.0  },
       { voiceURI: 'sv-nam-nam', name: 'VN Giong Nam - Mien Nam', lang: 'vi-VN', isFallback: true, pitch: 0.4, rateBoost: 0.95 },
       { voiceURI: 'vi-VN-HoaiMyNeural', name: 'Microsoft Hoài My Online (Natural) - Vietnamese (Vietnam)', lang: 'vi-VN', isFallback: true, pitch: 1.0, rateBoost: 1.0 },
-      { voiceURI: 'vi-VN-NamMinhNeural', name: 'Microsoft Nam Minh Online (Natural) - Vietnamese (Vietnam)', lang: 'vi-VN', isFallback: true, pitch: 1.0, rateBoost: 1.0 }
+      { voiceURI: 'vi-VN-NamMinhNeural', name: 'Microsoft Nam Minh Online (Natural) - Vietnamese (Vietnam)', lang: 'vi-VN', isFallback: true, pitch: 1.0, rateBoost: 1.0 },
+      { voiceURI: 'Phạm Tuyên', name: 'VieNeu Phạm Tuyên (Local AI - Nam Bắc)', lang: 'vi-VN', isFallback: true, pitch: 1.0, rateBoost: 1.0 },
+      { voiceURI: 'Minh Đức', name: 'VieNeu Minh Đức (Local AI - Nam Bắc)', lang: 'vi-VN', isFallback: true, pitch: 1.0, rateBoost: 1.0 },
+      { voiceURI: 'Thanh Bình', name: 'VieNeu Thanh Bình (Local AI - Nam Bắc)', lang: 'vi-VN', isFallback: true, pitch: 1.0, rateBoost: 1.0 },
+      { voiceURI: 'Trúc Ly', name: 'VieNeu Trúc Ly (Local AI - Nữ Bắc)', lang: 'vi-VN', isFallback: true, pitch: 1.0, rateBoost: 1.0 },
+      { voiceURI: 'Mai Anh', name: 'VieNeu Mai Anh (Local AI - Nữ Bắc)', lang: 'vi-VN', isFallback: true, pitch: 1.0, rateBoost: 1.0 }
     ];
     this.fallbackVoice = this.fallbackVoices[0];
   }
@@ -249,15 +255,17 @@ class TTSService {
       return this.prefetchCache.get(index);
     }
     const paragraphText = this.chunks[index];
-    const MAX = 3000; 
+    const voiceName = this._getSAPIVoiceName();
+    const vieneuVoices = ['Phạm Tuyên', 'Minh Đức', 'Thanh Bình', 'Trúc Ly', 'Mai Anh'];
+    const isVieneu = vieneuVoices.includes(voiceName);
+
+    const MAX = isVieneu ? 250 : 800; 
     const subChunks = paragraphText.length <= MAX
       ? [paragraphText]
       : this.splitParagraphForFallback(paragraphText, MAX);
-
-    const voiceName = this._getSAPIVoiceName();
     
     const fetchPromises = subChunks.map(text => 
-      fetch('/offline/synthesize', {
+      fetch(isVieneu ? '/offline/vieneu' : '/offline/synthesize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, voiceName, rate: this.rate }),
@@ -315,7 +323,9 @@ class TTSService {
           }
         }
         
-        const audio = new Audio("data:audio/mp3;base64," + data.audioBase64);
+        const isWav = data.audioBase64.startsWith('UklGR');
+        const mime = isWav ? 'audio/wav' : 'audio/mp3';
+        const audio = new Audio(`data:${mime};base64,` + data.audioBase64);
         this.currentAudio = audio;
         
         // Time update for Karaoke Mode
@@ -360,27 +370,132 @@ class TTSService {
 
   // ─── Download Audio ─────────────────────────────────────────────────────────
 
-  async downloadAudio(text, mode, fileName, onProgress, silenceDuration = 0, exportSrt = false) {
-    const chunks = this.chunkText(text);
-    if (chunks.length === 0) throw new Error('Khong co noi dung de tai xuong.');
-
+  async downloadAudio(text, mode = 'online', fileName = 'audio.mp3', onProgress = null, silenceDuration = 0, exportSrt = false) {
     if (mode === 'offline') {
-      return this._downloadOfflineSAPI(chunks, fileName, onProgress, silenceDuration, exportSrt);
+      return this._downloadOfflineSAPI(text, fileName, onProgress, silenceDuration, exportSrt);
+    } else if (mode === 'vieneu') {
+      return this._downloadOfflineVieneu(text, fileName, onProgress, silenceDuration, exportSrt);
     } else {
-      return this._downloadOnline(chunks, fileName, onProgress);
+      return this._downloadOnline(text, fileName, onProgress);
     }
   }
 
-  async _downloadOfflineSAPI(chunks, fileName, onProgress, silenceDuration = 0, exportSrt = false) {
+  // ── Vieneu (Local AI) ──────────────────────────────────────────────────────
+  async _downloadOfflineVieneu(text, fileName, onProgress, silenceDuration = 0, exportSrt = false) {
+    let voiceName = this._getSAPIVoiceName();
+    
+    // Auto fallback if user forgot to select a VieNeu voice
+    const vieneuVoices = ['Phạm Tuyên', 'Minh Đức', 'Thanh Bình', 'Trúc Ly', 'Mai Anh'];
+    if (!vieneuVoices.includes(voiceName)) {
+      if (voiceName.toLowerCase().includes('hoai') || voiceName.toLowerCase().includes('nữ') || voiceName.toLowerCase().includes('female')) {
+        voiceName = 'Mai Anh';
+      } else {
+        voiceName = 'Phạm Tuyên';
+      }
+    }
+
+    const batches = this.splitParagraphForFallback(text, 250);
+    const total = batches.length;
+    let completed = 0;
+    const results = new Array(total).fill(null);
+
+    const synthesizeVieneu = async (text, idx) => {
+      const cacheKey = `vieneu-cache-${fileName}-${idx}`;
+      try {
+        const cached = await get(cacheKey);
+        if (cached && cached.audioBuf) return cached;
+      } catch(e) {}
+
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const resp = await fetch('/offline/vieneu', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, voiceName })
+          });
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          const data = await resp.json();
+          if (!data.audioBase64) throw new Error('Empty audioBase64 from Vieneu');
+          
+          const binary = atob(data.audioBase64);
+          const buf = new Uint8Array(binary.length);
+          for(let i=0; i<binary.length; i++) buf[i] = binary.charCodeAt(i);
+          
+          const result = { audioBuf: buf, originalText: text };
+          await set(cacheKey, result).catch(()=>({}));
+          return result;
+        } catch(e) {
+          if (attempt < 2) await new Promise(r => setTimeout(r, 2000));
+          else console.warn(`[Vieneu] Skip batch ${idx}: ${e.message}`);
+        }
+      }
+      return null;
+    };
+
+    let skipped = 0;
+    for (let i = 0; i < total; i++) {
+      const res = await synthesizeVieneu(batches[i], i);
+      results[i] = res;
+      if (!res) skipped++;
+      completed++;
+      onProgress && onProgress(Math.round((completed / total) * 95));
+    }
+
+    const validResults = results.filter(Boolean);
+    if (validResults.length === 0) {
+      throw new Error('Vieneu synthesis failed (all chunks skipped).');
+    }
+
+    // Merge WAV buffers
+    const buffers = validResults.map(r => r.audioBuf);
+    
+    // Create silence buffer (WAV PCM 16-bit 48000Hz mono = 96000 bytes/sec)
+    const bytesPerSec = 48000 * 2; 
+    const silenceLen = Math.floor(bytesPerSec * silenceDuration);
+    const silenceBuf = new Uint8Array(silenceLen); // filled with 0s (silence)
+
+    let totalDataLen = 0;
+    for (let i = 0; i < buffers.length; i++) {
+      totalDataLen += (buffers[i].length - 44);
+      if (i < buffers.length - 1 && silenceDuration > 0) {
+        totalDataLen += silenceLen;
+      }
+    }
+    
+    const merged = new Uint8Array(44 + totalDataLen);
+    merged.set(buffers[0].slice(0, 44), 0); // copy header
+    
+    const view = new DataView(merged.buffer);
+    view.setUint32(4, 36 + totalDataLen, true);
+    view.setUint32(40, totalDataLen, true);
+    
+    let offset = 44;
+    for (let i = 0; i < buffers.length; i++) {
+      const data = buffers[i].slice(44);
+      merged.set(data, offset);
+      offset += data.length;
+      if (i < buffers.length - 1 && silenceDuration > 0) {
+        merged.set(silenceBuf, offset);
+        offset += silenceLen;
+      }
+    }
+
+    const blob = new Blob([merged], { type: 'audio/wav' });
+    const outName = fileName.replace(/\.[^.]+$/, '.wav');
+    this._triggerDownload(blob, outName);
+
+    for (let i = 0; i < total; i++) del(`vieneu-cache-${fileName}-${i}`).catch(()=>({}));
+    
+    onProgress && onProgress(100);
+  }
+
+  // ── SAPI (Edge-TTS Offline) ────────────────────────────────────────────────
+  async _downloadOfflineSAPI(text, fileName, onProgress, silenceDuration = 0, exportSrt = false) {
     const voiceName = this._getSAPIVoiceName();
     const rate      = this.rate;
 
     // Use chunks directly to preserve semantic pauses (paragraphs/sentences)
-    const batches = [];
-    for (const chunk of chunks) {
-      const subChunks = this.splitParagraphForFallback(chunk, 3000);
-      batches.push(...subChunks);
-    }
+    const batches = this.splitParagraphForFallback(text, 800);
     const total = batches.length;
 
     const CONCURRENCY = 1; // Sequential to avoid rate limiting from Microsoft Edge TTS
@@ -391,6 +506,19 @@ class TTSService {
     const results = new Array(total).fill(null);
 
     const synthesizeMp3 = async (text, idx) => {
+      const cacheKey = `chunk-cache-${fileName}-${idx}`;
+      
+      // 1. Kiểm tra cache (Resume)
+      try {
+        const cached = await get(cacheKey);
+        if (cached && cached.audioBuf) {
+          return cached;
+        }
+      } catch (e) {
+        console.warn(`[EdgeTTS] Loi doc cache chunk ${idx}`, e);
+      }
+
+      // 2. Fetch mới
       for (let attempt = 0; attempt < 4; attempt++) {
         try {
           const resp = await fetch('/offline/synthesize', {
@@ -409,7 +537,15 @@ class TTSService {
           const buf = new Uint8Array(binary.length);
           for(let i=0; i<binary.length; i++) buf[i] = binary.charCodeAt(i);
           
-          return { audioBuf: buf, vttText: data.vtt || '', originalText: text };
+          
+          const result = { audioBuf: buf, vttText: data.vtt || '', originalText: text };
+          
+          // Lưu vào cache
+          try {
+            await set(cacheKey, result);
+          } catch(e) {}
+          
+          return result;
         } catch (err) {
           if (attempt === 3) {
             console.warn(`[EdgeTTS] Bo qua batch ${idx}: ${err.message}`);
@@ -422,15 +558,24 @@ class TTSService {
     };
 
     let skippedCount = 0;
+    let consecutiveFails = 0;
 
     let queueIdx = 0;
     const workerPipeline = async (workerIdx) => {
       await new Promise(r => setTimeout(r, workerIdx * 200));
       while (queueIdx < total) {
+        if (consecutiveFails >= 3) {
+          throw new Error('Microsoft Edge TTS đã chặn kết nối hoặc báo lỗi liên tục. Vui lòng giảm tốc độ tải hoặc thử lại sau (do tải quá nhiều).');
+        }
         const i = queueIdx++;
         const res = await synthesizeMp3(batches[i], i);
         results[i] = res;
-        if (!res) skippedCount++;
+        if (!res) {
+          skippedCount++;
+          consecutiveFails++;
+        } else {
+          consecutiveFails = 0;
+        }
         completed++;
         const pct = Math.round((completed / total) * 93);
         onProgress && onProgress(pct);
@@ -543,6 +688,11 @@ class TTSService {
       this._triggerDownload(srtBlob, srtOutName);
     }
 
+    // Dọn dẹp cache sau khi tải thành công
+    for (let i = 0; i < total; i++) {
+      del(`chunk-cache-${fileName}-${i}`).catch(()=>({}));
+    }
+
     onProgress && onProgress(100);
     console.log('[EdgeTTS-offline] Hoan thanh 100%! MP3 size:', (blob.size / 1024 / 1024).toFixed(2), 'MB');
   }
@@ -564,8 +714,8 @@ class TTSService {
     // Fallback profiles map
     if (!this.voice || this.voice.isFallback) {
       const uri = this.voice ? this.voice.voiceURI : '';
-      if (uri === 'vi-VN-HoaiMyNeural') return 'vi-VN-HoaiMyNeural';
-      if (uri === 'vi-VN-NamMinhNeural') return 'vi-VN-NamMinhNeural';
+      if (['vi-VN-HoaiMyNeural', 'vi-VN-NamMinhNeural', 'Phạm Tuyên', 'Minh Đức', 'Thanh Bình', 'Trúc Ly', 'Mai Anh'].includes(uri)) return uri;
+      
       // fallback voices: sv-nu-bac, sv-nu-nam => female, sv-nam-bac, sv-nam-nam => male
       if (uri.includes('nu')) return 'vi-VN-HoaiMyNeural';
       if (uri.includes('nam')) return 'vi-VN-NamMinhNeural';

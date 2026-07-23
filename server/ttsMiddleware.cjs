@@ -14,6 +14,68 @@ const fs     = require('fs');
 const os     = require('os');
 const path   = require('path');
 const crypto = require('crypto');
+const readline = require('readline');
+
+// ── Vieneu Worker Manager ──────────────────────────────────────────────────────
+let vieneuProcess = null;
+let vieneuRl = null;
+let vieneuPending = new Map();
+
+function getVieneuWorker() {
+  if (vieneuProcess && !vieneuProcess.killed) return vieneuProcess;
+
+  vieneuProcess = spawn('python', [path.join(__dirname, 'vieneu_worker.py')]);
+  
+  vieneuRl = readline.createInterface({
+    input: vieneuProcess.stdout,
+    terminal: false
+  });
+
+  vieneuRl.on('line', (line) => {
+    if (line === 'LOADING' || line === 'READY' || line.startsWith('ERROR:')) {
+      console.log(`[VieNeu Worker] ${line}`);
+      return;
+    }
+    try {
+      const data = JSON.parse(line);
+      const reqId = data.id;
+      if (reqId && vieneuPending.has(reqId)) {
+        const { resolve, reject } = vieneuPending.get(reqId);
+        vieneuPending.delete(reqId);
+        if (data.error) reject(new Error(data.error + '\n' + data.traceback));
+        else resolve(data);
+      }
+    } catch (e) {
+      console.log(`[VieNeu Worker stdout]: ${line}`);
+    }
+  });
+
+  vieneuProcess.stderr.on('data', data => {
+    console.error(`[VieNeu Worker stderr]: ${data.toString().trim()}`);
+  });
+
+  vieneuProcess.on('close', code => {
+    console.log(`[VieNeu Worker] Closed with code ${code}`);
+    for (const { reject } of vieneuPending.values()) {
+      reject(new Error('Vieneu worker process closed unexpectedly'));
+    }
+    vieneuPending.clear();
+    vieneuProcess = null;
+  });
+
+  return vieneuProcess;
+}
+
+function synthesizeVieneu(text, voice) {
+  return new Promise((resolve, reject) => {
+    const worker = getVieneuWorker();
+    const id = crypto.randomUUID();
+    vieneuPending.set(id, { resolve, reject });
+    
+    const req = JSON.stringify({ id, text, voice });
+    worker.stdin.write(req + '\n');
+  });
+}
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -50,6 +112,11 @@ const VOICE_MAP = {
 const VOICE_LIST = [
   { name: 'Microsoft Hoai My Online (Natural) - Vietnamese (Vietnam)',  edgeId: 'vi-VN-HoaiMyNeural',  gender: 'Female' },
   { name: 'Microsoft Nam Minh Online (Natural) - Vietnamese (Vietnam)', edgeId: 'vi-VN-NamMinhNeural', gender: 'Male'   },
+  { name: 'VieNeu Phạm Tuyên (Local AI - Nam)', edgeId: 'Phạm Tuyên', gender: 'Male' },
+  { name: 'VieNeu Minh Đức (Local AI - Nam)', edgeId: 'Minh Đức', gender: 'Male' },
+  { name: 'VieNeu Minh Hoàng (Local AI - Nam)', edgeId: 'Minh Hoàng', gender: 'Male' },
+  { name: 'VieNeu Ngọc Trân (Local AI - Nữ)', edgeId: 'Ngọc Trân', gender: 'Female' },
+  { name: 'VieNeu Mai Phương (Local AI - Nữ)', edgeId: 'Mai Phương', gender: 'Female' },
 ];
 
 /** Resolve a voiceName string to an edge-tts voice ID.
@@ -194,10 +261,10 @@ async def main():
         except Exception as e:
             last_error = str(e)
             wait_time = (attempt + 1) * 1.5
-            sys.stderr.write(f"Attempt {attempt+1} failed: {e}, retrying in {wait_time}s\n")
+            sys.stderr.write(f"Attempt {attempt+1} failed: {e}, retrying in {wait_time}s\\n")
             await asyncio.sleep(wait_time)
     
-    sys.stderr.write(f"All attempts failed: {last_error}\n")
+    sys.stderr.write(f"All attempts failed: {last_error}\\n")
     sys.exit(1)
 
 asyncio.run(main())
@@ -281,6 +348,30 @@ module.exports = function ttsMiddleware(req, res, next) {
       })
       .catch(err => {
         console.error('[TTS-offline] synthesize error:', err.message);
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+      });
+    return;
+  }
+
+  // POST /offline/vieneu
+  if (req.method === 'POST' && url === '/offline/vieneu') {
+    readBody(req)
+      .then(({ text, voiceName }) => {
+        if (!text || text.trim().length === 0) {
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: 'Empty text' }));
+          return Promise.resolve(null);
+        }
+        return synthesizeVieneu(text, voiceName || 'Phạm Tuyên');
+      })
+      .then(result => {
+        if (!result) return;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      })
+      .catch(err => {
+        console.error('[TTS-offline] vieneu synthesize error:', err.message);
         res.statusCode = 500;
         res.end(JSON.stringify({ error: err.message }));
       });
