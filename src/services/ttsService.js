@@ -536,11 +536,11 @@ class TTSService {
     const rate      = this.rate;
 
     // Use chunks directly to preserve semantic pauses (paragraphs/sentences)
-    const batches = this.splitParagraphForFallback(text, 800);
+    const batches = this.splitParagraphForFallback(text, 5000);
     const total = batches.length;
 
     const CONCURRENCY = 1; // Sequential to avoid rate limiting from Microsoft Edge TTS
-    const DELAY_BETWEEN_MS = 600; // ms between requests
+    const DELAY_BETWEEN_MS = 1000; // Increased to 1000ms to be safer against Microsoft bans
     console.log(`[EdgeTTS-offline] Tong hop: ${total} batch. Song song: ${CONCURRENCY} luong (sequential). Silence: ${silenceDuration}s. SRT: ${exportSrt}`);
 
     let completed = 0;

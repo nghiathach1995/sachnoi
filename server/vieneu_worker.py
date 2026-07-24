@@ -34,6 +34,12 @@ def main():
             text = req.get("text", "")
             voice = req.get("voice", "Phạm Tuyên")
             
+            try:
+                from vietnamese_normalizer import normalize_vietnamese_text
+                text = normalize_vietnamese_text(text)
+            except ImportError:
+                pass
+
             audio = v.infer(text, voice=voice)
             
             # Save to WAV in memory
