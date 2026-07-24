@@ -3,6 +3,36 @@ import { Settings, Play, Pause, SkipBack, SkipForward, File, Upload, CheckCircle
 import { get, set, del } from 'idb-keyval';
 import { parseFile } from './services/fileParser';
 import ttsService from './services/ttsService';
+import './App.css';
+
+const DownloadTimer = ({ startTime, progress, isActive }) => {
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    if (!startTime || progress >= 100 || !isActive) return;
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [startTime, progress, isActive]);
+
+  if (!startTime || progress === 0) return null;
+
+  const elapsedSec = Math.floor((now - startTime) / 1000);
+  const estimatedTotalSec = progress > 0 ? (elapsedSec / (progress / 100)) : 0;
+  const remainingSec = Math.max(0, Math.floor(estimatedTotalSec - elapsedSec));
+
+  const formatTime = (sec) => {
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return `${m}p${s < 10 ? '0' : ''}${s}s`;
+  };
+
+  return (
+    <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginTop: '0.5rem', display: 'flex', justifyContent: 'space-between' }}>
+      <span>Đã tải: <strong style={{color: 'var(--text-primary)'}}>{formatTime(elapsedSec)}</strong></span>
+      <span>Dự kiến còn: <strong style={{color: 'var(--accent-primary)'}}>{formatTime(remainingSec)}</strong></span>
+    </div>
+  );
+};
 
 // File extensions supported
 const SUPPORTED_EXTS = ['.txt', '.pdf', '.epub', '.docx'];
@@ -38,8 +68,10 @@ function App() {
   const [downloadMode, setDownloadMode] = useState('offline');
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadStartTime, setDownloadStartTime] = useState(null);
   const [downloadDone, setDownloadDone] = useState(false);
   const [downloadError, setDownloadError] = useState(null);
+  const [downloadResumeInfo, setDownloadResumeInfo] = useState(''); // e.g. "Tiếp tục từ 120/450 đoạn"
   
   const [silenceDuration, setSilenceDuration] = useState(0);
   const [exportSrt, setExportSrt] = useState(false);
@@ -294,9 +326,12 @@ function App() {
     setDownloadError(null);
     setDownloadDone(false);
     setDownloadProgress(0);
+    setDownloadResumeInfo('');
 
     const baseName = uploadedFileName ? uploadedFileName.replace(/\.[^.]+$/, '') : 'audio';
     const outFileName = baseName + '.mp3';
+
+    setDownloadStartTime(Date.now());
 
     try {
       await ttsService.downloadAudio(
@@ -305,14 +340,26 @@ function App() {
         outFileName,
         (pct) => setDownloadProgress(Math.round(pct)),
         silenceDuration,
-        exportSrt
+        exportSrt,
+        (status) => {
+          if (status.startsWith('resume:')) {
+            const [cached, total] = status.replace('resume:', '').split('/');
+            setDownloadResumeInfo(`♻️ Tiếp tục từ ${cached}/${total} đoạn đã lưu`);
+          }
+        }
       );
       setDownloadDone(true);
     } catch (err) {
-      setDownloadError(err.message);
+      if (!err.message.includes('huỷ')) setDownloadError(err.message);
     } finally {
       setIsDownloading(false);
     }
+  };
+
+  const handleCancelDownload = () => {
+    ttsService.cancelDownload();
+    setIsDownloading(false);
+    setDownloadError('Đã huỷ tải xuống. Tiến trình đã lưu, bấm Tải xuống để tiếp tục.');
   };
 
   // ─── Batch download ────────────────────────────────────────────────────────
@@ -322,6 +369,7 @@ function App() {
     setIsBatchRunning(true);
     setDownloadDone(false);
     setDownloadError(null);
+    setDownloadStartTime(Date.now());
 
     // Lấy history lưu trữ IndexedDB
     const historyKey = `exported-${folderName}`;
@@ -804,6 +852,11 @@ function App() {
 
               {isDownloading && (
                 <div style={{ marginBottom: '1rem' }}>
+                  {downloadResumeInfo && (
+                    <div style={{ marginBottom: '0.5rem', padding: '0.4rem 0.75rem', borderRadius: '0.5rem', background: 'rgba(99,102,241,0.15)', border: '1px solid rgba(99,102,241,0.4)', color: '#a78bfa', fontSize: '0.82rem' }}>
+                      {downloadResumeInfo}
+                    </div>
+                  )}
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '0.4rem' }}>
                     <span>
                       {downloadMode === 'offline'
@@ -815,6 +868,13 @@ function App() {
                   <div style={{ width: '100%', height: '8px', borderRadius: '999px', background: 'rgba(255,255,255,0.1)', overflow: 'hidden' }}>
                     <div style={{ height: '100%', width: `${downloadProgress}%`, background: 'linear-gradient(90deg, var(--accent-primary), var(--accent-hover))', borderRadius: '999px', transition: 'width 0.3s ease' }} />
                   </div>
+                  <DownloadTimer startTime={downloadStartTime} progress={downloadProgress} isActive={isDownloading} />
+                  <button
+                    onClick={handleCancelDownload}
+                    style={{ marginTop: '0.5rem', padding: '0.4rem 1rem', borderRadius: '0.5rem', background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.4)', color: '#f87171', fontSize: '0.82rem', cursor: 'pointer', fontWeight: 600 }}
+                  >
+                    ⏹ Tạm dừng &amp; Lưu tiến trình
+                  </button>
                 </div>
               )}
 
@@ -825,8 +885,8 @@ function App() {
               )}
 
               {downloadError && (
-                <div style={{ marginBottom: '1rem', padding: '0.75rem 1rem', borderRadius: '0.75rem', background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.4)', color: '#f87171', fontSize: '0.9rem' }}>
-                  ❌ {downloadError}
+                <div style={{ marginBottom: '1rem', padding: '0.75rem 1rem', borderRadius: '0.75rem', background: downloadError.includes('Đã huỷ') ? 'rgba(99,102,241,0.12)' : 'rgba(239,68,68,0.15)', border: `1px solid ${downloadError.includes('Đã huỷ') ? 'rgba(99,102,241,0.4)' : 'rgba(239,68,68,0.4)'}`, color: downloadError.includes('Đã huỷ') ? '#a78bfa' : '#f87171', fontSize: '0.9rem' }}>
+                  {downloadError.includes('Đã huỷ') ? '⏸ ' : '❌ '}{downloadError}
                 </div>
               )}
 
@@ -845,11 +905,12 @@ function App() {
                       : `Đang tải... ${downloadProgress}%`}
                   </>
                 ) : (
-                  <><Download size={20} /> Tải xuống audio ({outputFormat})</>
+                  <><Download size={20} /> {downloadError && downloadError.includes('Đã huỷ') ? 'Tiếp tục tải' : `Tải xuống audio (${outputFormat})`}</>
                 )}
               </button>
             </>
           )}
+
 
           {/* ── FOLDER / BATCH mode UI ── */}
           {folderMode && batchFiles.length > 0 && (
@@ -870,6 +931,7 @@ function App() {
                 <div style={{ width: '100%', height: '10px', borderRadius: '999px', background: 'rgba(255,255,255,0.1)', overflow: 'hidden' }}>
                   <div style={{ height: '100%', width: `${batchTotalProgress}%`, background: 'linear-gradient(90deg, #6366f1, #a78bfa)', borderRadius: '999px', transition: 'width 0.4s ease' }} />
                 </div>
+                {isBatchRunning && <DownloadTimer startTime={downloadStartTime} progress={batchTotalProgress} isActive={isBatchRunning} />}
               </div>
 
               {/* File list table */}

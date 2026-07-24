@@ -1,0 +1,14 @@
+Minh Đức: Nam · Bắc · Phong cách tin tức
+Phạm Tuyên: Nam · Bắc · Phong cách tự nhiên
+Thái Sơn: Nam · Nam · Phong cách kể chuyện
+Xuân Vĩnh: Nam · Nam · Phong cách tự nhiên
+Thanh Bình: Nam · Bắc · Phong cách kể chuyện
+Trúc Ly: Nữ · Bắc · Phong cách tự nhiên
+Ngọc Linh: Nữ · Bắc · Phong cách kể chuyện
+Đoan Trang: Nữ · Bắc · Phong cách tự nhiên
+Mai Anh: Nữ · Bắc · Phong cách tin tức
+Thục Đoan: Nữ · Nam · Phong cách kể chuyện
+Minh Triết: Nam · Nam · Phong cách tin tức
+Thùy Dung: Nữ · Nam · Phong cách tin tức
+Quang Sơn: Nam · Trung · Phong cách tự nhiên
+Ngọc Trân: Nữ · Trung · Phong cách tự nhiên

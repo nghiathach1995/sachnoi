@@ -370,18 +370,34 @@ class TTSService {
 
   // ─── Download Audio ─────────────────────────────────────────────────────────
 
-  async downloadAudio(text, mode = 'online', fileName = 'audio.mp3', onProgress = null, silenceDuration = 0, exportSrt = false) {
+  // Cancel current download
+  cancelDownload() {
+    this._downloadCancelled = true;
+  }
+
+  async downloadAudio(text, mode = 'online', fileName = 'audio.mp3', onProgress = null, silenceDuration = 0, exportSrt = false, onStatus = null) {
+    this._downloadCancelled = false;
     if (mode === 'offline') {
-      return this._downloadOfflineSAPI(text, fileName, onProgress, silenceDuration, exportSrt);
+      return this._downloadOfflineSAPI(text, fileName, onProgress, silenceDuration, exportSrt, onStatus);
     } else if (mode === 'vieneu') {
-      return this._downloadOfflineVieneu(text, fileName, onProgress, silenceDuration, exportSrt);
+      return this._downloadOfflineVieneu(text, fileName, onProgress, silenceDuration, exportSrt, onStatus);
     } else {
       return this._downloadOnline(text, fileName, onProgress);
     }
   }
 
+  // Stable hash for cache keys (so key doesn't change if split size changes)
+  _hashText(str) {
+    let hash = 0;
+    for (let i = 0; i < Math.min(str.length, 200); i++) {
+      hash = ((hash << 5) - hash) + str.charCodeAt(i);
+      hash |= 0;
+    }
+    return Math.abs(hash).toString(36);
+  }
+
   // ── Vieneu (Local AI) ──────────────────────────────────────────────────────
-  async _downloadOfflineVieneu(text, fileName, onProgress, silenceDuration = 0, exportSrt = false) {
+  async _downloadOfflineVieneu(text, fileName, onProgress, silenceDuration = 0, exportSrt = false, onStatus = null) {
     let voiceName = this._getSAPIVoiceName();
     
     // Auto fallback if user forgot to select a VieNeu voice
@@ -399,19 +415,36 @@ class TTSService {
     let completed = 0;
     const results = new Array(total).fill(null);
 
-    const synthesizeVieneu = async (text, idx) => {
-      const cacheKey = `vieneu-cache-${fileName}-${idx}`;
+    // Check how many are already cached
+    let cachedCount = 0;
+    for (let i = 0; i < total; i++) {
+      const cacheKey = `vn-${this._hashText(batches[i])}-${voiceName}`;
       try {
         const cached = await get(cacheKey);
-        if (cached && cached.audioBuf) return cached;
+        if (cached && cached.audioBuf) cachedCount++;
+      } catch(e) {}
+    }
+    if (cachedCount > 0) {
+      onStatus && onStatus(`resume:${cachedCount}/${total}`);
+    }
+
+    const synthesizeVieneu = async (batchText, idx) => {
+      // Stable cache key based on content hash, not index
+      const cacheKey = `vn-${this._hashText(batchText)}-${voiceName}`;
+      try {
+        const cached = await get(cacheKey);
+        if (cached && cached.audioBuf) return { ...cached, fromCache: true };
       } catch(e) {}
 
+      if (this._downloadCancelled) return null;
+
       for (let attempt = 0; attempt < 3; attempt++) {
+        if (this._downloadCancelled) return null;
         try {
           const resp = await fetch('/offline/vieneu', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, voiceName })
+            body: JSON.stringify({ text: batchText, voiceName })
           });
           if (!resp.ok) throw new Error('HTTP ' + resp.status);
           const data = await resp.json();
@@ -421,7 +454,7 @@ class TTSService {
           const buf = new Uint8Array(binary.length);
           for(let i=0; i<binary.length; i++) buf[i] = binary.charCodeAt(i);
           
-          const result = { audioBuf: buf, originalText: text };
+          const result = { audioBuf: buf, originalText: batchText };
           await set(cacheKey, result).catch(()=>({}));
           return result;
         } catch(e) {
@@ -433,12 +466,26 @@ class TTSService {
     };
 
     let skipped = 0;
-    for (let i = 0; i < total; i++) {
-      const res = await synthesizeVieneu(batches[i], i);
-      results[i] = res;
-      if (!res) skipped++;
-      completed++;
-      onProgress && onProgress(Math.round((completed / total) * 95));
+    const CONCURRENCY = 3;
+    let currentIndex = 0;
+
+    const workers = Array.from({ length: CONCURRENCY }, async () => {
+      while (true) {
+        if (this._downloadCancelled) break;
+        const i = currentIndex++;
+        if (i >= total) break;
+        const res = await synthesizeVieneu(batches[i], i);
+        results[i] = res;
+        if (!res) skipped++;
+        completed++;
+        onProgress && onProgress(Math.round((completed / total) * 95));
+      }
+    });
+
+    await Promise.all(workers);
+
+    if (this._downloadCancelled) {
+      throw new Error('Đã huỷ tải xuống.');
     }
 
     const validResults = results.filter(Boolean);
@@ -446,51 +493,45 @@ class TTSService {
       throw new Error('Vieneu synthesis failed (all chunks skipped).');
     }
 
-    // Merge WAV buffers
+    // Merge WAV buffers using Blob parts (memory efficient)
     const buffers = validResults.map(r => r.audioBuf);
     
     // Create silence buffer (WAV PCM 16-bit 48000Hz mono = 96000 bytes/sec)
     const bytesPerSec = 48000 * 2; 
     const silenceLen = Math.floor(bytesPerSec * silenceDuration);
-    const silenceBuf = new Uint8Array(silenceLen); // filled with 0s (silence)
+    const silenceBuf = new Uint8Array(silenceLen);
 
     let totalDataLen = 0;
+    const blobParts = [];
+    const headerBuf = new Uint8Array(44);
+    blobParts.push(headerBuf);
+
     for (let i = 0; i < buffers.length; i++) {
-      totalDataLen += (buffers[i].length - 44);
+      const data = buffers[i].slice(44);
+      totalDataLen += data.length;
+      blobParts.push(data);
       if (i < buffers.length - 1 && silenceDuration > 0) {
         totalDataLen += silenceLen;
+        blobParts.push(silenceBuf);
       }
     }
     
-    const merged = new Uint8Array(44 + totalDataLen);
-    merged.set(buffers[0].slice(0, 44), 0); // copy header
-    
-    const view = new DataView(merged.buffer);
+    headerBuf.set(buffers[0].slice(0, 44), 0);
+    const view = new DataView(headerBuf.buffer);
     view.setUint32(4, 36 + totalDataLen, true);
     view.setUint32(40, totalDataLen, true);
     
-    let offset = 44;
-    for (let i = 0; i < buffers.length; i++) {
-      const data = buffers[i].slice(44);
-      merged.set(data, offset);
-      offset += data.length;
-      if (i < buffers.length - 1 && silenceDuration > 0) {
-        merged.set(silenceBuf, offset);
-        offset += silenceLen;
-      }
-    }
-
-    const blob = new Blob([merged], { type: 'audio/wav' });
+    const blob = new Blob(blobParts, { type: 'audio/wav' });
     const outName = fileName.replace(/\.[^.]+$/, '.wav');
     this._triggerDownload(blob, outName);
 
-    for (let i = 0; i < total; i++) del(`vieneu-cache-${fileName}-${i}`).catch(()=>({}));
-    
+    // Only clear cache AFTER successful download+trigger
+    // Do NOT clear Vieneu cache - keep it for resume if browser fails to save
     onProgress && onProgress(100);
   }
 
   // ── SAPI (Edge-TTS Offline) ────────────────────────────────────────────────
-  async _downloadOfflineSAPI(text, fileName, onProgress, silenceDuration = 0, exportSrt = false) {
+  async _downloadOfflineSAPI(text, fileName, onProgress, silenceDuration = 0, exportSrt = false, onStatus = null) {
     const voiceName = this._getSAPIVoiceName();
     const rate      = this.rate;
 
@@ -505,26 +546,43 @@ class TTSService {
     let completed = 0;
     const results = new Array(total).fill(null);
 
-    const synthesizeMp3 = async (text, idx) => {
-      const cacheKey = `chunk-cache-${fileName}-${idx}`;
+    // Check how many chunks are already cached (for resume UI)
+    let cachedCount = 0;
+    for (let i = 0; i < total; i++) {
+      const cacheKey = `sapi-${this._hashText(batches[i])}-${voiceName}`;
+      try {
+        const cached = await get(cacheKey);
+        if (cached && cached.audioBuf) cachedCount++;
+      } catch(e) {}
+    }
+    if (cachedCount > 0) {
+      onStatus && onStatus(`resume:${cachedCount}/${total}`);
+    }
+
+    const synthesizeMp3 = async (batchText, idx) => {
+      // Use stable content-based cache key (survives F5 and file re-select)
+      const cacheKey = `sapi-${this._hashText(batchText)}-${voiceName}`;
       
-      // 1. Kiểm tra cache (Resume)
+      // 1. Check cache (Resume)
       try {
         const cached = await get(cacheKey);
         if (cached && cached.audioBuf) {
-          return cached;
+          return { ...cached, fromCache: true };
         }
       } catch (e) {
         console.warn(`[EdgeTTS] Loi doc cache chunk ${idx}`, e);
       }
 
-      // 2. Fetch mới
+      if (this._downloadCancelled) return null;
+
+      // 2. Fetch new
       for (let attempt = 0; attempt < 4; attempt++) {
+        if (this._downloadCancelled) return null;
         try {
           const resp = await fetch('/offline/synthesize', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, voiceName, rate }),
+            body: JSON.stringify({ text: batchText, voiceName, rate }),
           });
           if (!resp.ok) {
             const errBody = await resp.json().catch(() => ({}));
@@ -537,10 +595,9 @@ class TTSService {
           const buf = new Uint8Array(binary.length);
           for(let i=0; i<binary.length; i++) buf[i] = binary.charCodeAt(i);
           
+          const result = { audioBuf: buf, vttText: data.vtt || '', originalText: batchText };
           
-          const result = { audioBuf: buf, vttText: data.vtt || '', originalText: text };
-          
-          // Lưu vào cache
+          // Cache it
           try {
             await set(cacheKey, result);
           } catch(e) {}
@@ -564,6 +621,7 @@ class TTSService {
     const workerPipeline = async (workerIdx) => {
       await new Promise(r => setTimeout(r, workerIdx * 200));
       while (queueIdx < total) {
+        if (this._downloadCancelled) break;
         if (consecutiveFails >= 3) {
           throw new Error('Microsoft Edge TTS đã chặn kết nối hoặc báo lỗi liên tục. Vui lòng giảm tốc độ tải hoặc thử lại sau (do tải quá nhiều).');
         }
@@ -572,18 +630,26 @@ class TTSService {
         results[i] = res;
         if (!res) {
           skippedCount++;
-          consecutiveFails++;
+          consecutiveFails++; // Only real network failures count
         } else {
-          consecutiveFails = 0;
+          consecutiveFails = 0; // Reset on any success (cached or fresh)
         }
         completed++;
         const pct = Math.round((completed / total) * 93);
         onProgress && onProgress(pct);
-        if (queueIdx < total) await new Promise(r => setTimeout(r, DELAY_BETWEEN_MS));
+        // Skip delay when chunk came from cache (no need to throttle)
+        if (queueIdx < total && res && !res.fromCache) {
+          await new Promise(r => setTimeout(r, DELAY_BETWEEN_MS));
+        }
       }
     };
 
     await Promise.all(Array.from({ length: CONCURRENCY }, (_, idx) => workerPipeline(idx)));
+
+    if (this._downloadCancelled) {
+      throw new Error('Đã huỷ tải xuống.');
+    }
+
 
     const validResults = results.filter(Boolean);
     const skipRate = skippedCount / total;
@@ -608,7 +674,6 @@ class TTSService {
     onProgress && onProgress(98);
 
     onProgress && onProgress(98);
-
     // Chuan bi Silence Buffer (Mặc định 700ms giữa các chunks, hoặc theo tùy chọn của user)
     const pauseMs = silenceDuration > 0 ? silenceDuration * 1000 : 700;
     
@@ -619,12 +684,9 @@ class TTSService {
     for(let i=0; i<bin.length; i++) oneSecSilence[i] = bin.charCodeAt(i);
     
     // Tính toán độ lớn buffer cho pauseMs
-    // (Vì 1 giây silenceBuf có size cố định, ta có thể tính byte length tỷ lệ thuận)
-    const byteRate = oneSecSilence.length; // bytes per second
+    const byteRate = oneSecSilence.length;
     const silenceBufLength = Math.floor(byteRate * (pauseMs / 1000));
     const silenceBuf = new Uint8Array(silenceBufLength);
-    // Fill with zero to create silent mp3 frame data? No, mp3 is not just zeros.
-    // Dùng frame silence lặp lại
     let offsetS = 0;
     while(offsetS < silenceBufLength) {
       const chunk = oneSecSilence.subarray(0, Math.min(oneSecSilence.length, silenceBufLength - offsetS));
@@ -632,16 +694,7 @@ class TTSService {
       offsetS += chunk.length;
     }
 
-    let totalAudioLength = 0;
-    for (let i = 0; i < validResults.length; i++) {
-      totalAudioLength += validResults[i].audioBuf.length;
-      if (i < validResults.length - 1) {
-        totalAudioLength += silenceBuf.length;
-      }
-    }
-
-    const merged = new Uint8Array(totalAudioLength);
-    let offset = 0;
+    const blobParts = [];
     
     let srtContent = "";
     let srtIndex = 1;
@@ -649,8 +702,7 @@ class TTSService {
 
     for (let i = 0; i < validResults.length; i++) {
       const res = validResults[i];
-      merged.set(res.audioBuf, offset);
-      offset += res.audioBuf.length;
+      blobParts.push(res.audioBuf);
       
       let chunkDurationMs = 0;
       if (exportSrt) {
@@ -672,13 +724,12 @@ class TTSService {
       currentOffsetMs += chunkDurationMs;
 
       if (i < validResults.length - 1) {
-        merged.set(silenceBuf, offset);
-        offset += silenceBuf.length;
+        if (silenceDuration > 0) blobParts.push(silenceBuf);
         currentOffsetMs += pauseMs;
       }
     }
 
-    const blob = new Blob([merged], { type: 'audio/mpeg' });
+    const blob = new Blob(blobParts, { type: 'audio/mpeg' });
     const outName = fileName.replace(/\.[^.]+$/, '.mp3');
     this._triggerDownload(blob, outName);
     
@@ -817,23 +868,12 @@ class TTSService {
       offsetS += chunk.length;
     }
 
-    let totalLength = 0;
+    const blobParts = [];
     for (let i = 0; i < mp3Buffers.length; i++) {
-      totalLength += mp3Buffers[i].length;
-      if (i < mp3Buffers.length - 1) totalLength += silenceBuf.length;
+      blobParts.push(mp3Buffers[i]);
+      if (i < mp3Buffers.length - 1) blobParts.push(silenceBuf);
     }
-    
-    const merged = new Uint8Array(totalLength);
-    let offset = 0;
-    for (let i = 0; i < mp3Buffers.length; i++) {
-      merged.set(mp3Buffers[i], offset); 
-      offset += mp3Buffers[i].length;
-      if (i < mp3Buffers.length - 1) {
-        merged.set(silenceBuf, offset);
-        offset += silenceBuf.length;
-      }
-    }
-    const blob    = new Blob([merged], { type: 'audio/mpeg' });
+    const blob    = new Blob(blobParts, { type: 'audio/mpeg' });
     const outName = fileName.replace(/\.[^.]+$/, '.mp3');
     this._triggerDownload(blob, outName);
     onProgress && onProgress(100);

@@ -20,10 +20,14 @@ def main():
         print(f"ERROR: Failed to load Vieneu: {e}", flush=True)
         return
 
-    for line in sys.stdin:
+    import concurrent.futures
+    import threading
+    print_lock = threading.Lock()
+
+    def process_req(line):
         line = line.strip()
         if not line:
-            continue
+            return
         try:
             req = json.loads(line)
             req_id = req.get("id")
@@ -40,10 +44,16 @@ def main():
             b64 = base64.b64encode(wav_bytes).decode('utf-8')
             
             out = {"id": req_id, "audioBase64": b64}
-            print(json.dumps(out), flush=True)
+            with print_lock:
+                print(json.dumps(out), flush=True)
         except Exception as e:
             err = {"id": req.get("id", "unknown"), "error": str(e), "traceback": traceback.format_exc()}
-            print(json.dumps(err), flush=True)
+            with print_lock:
+                print(json.dumps(err), flush=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        for line in sys.stdin:
+            executor.submit(process_req, line)
 
 if __name__ == "__main__":
     main()
